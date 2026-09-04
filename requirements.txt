@@ -1,0 +1,4 @@
+flet==0.82.0
+yagmail==0.15.293
+email-validator==2.3.0
+

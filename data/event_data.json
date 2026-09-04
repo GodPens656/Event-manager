@@ -1,0 +1,17 @@
+{
+  "event": {
+    "name": "",
+    "date": "",
+    "place": "",
+    "description": ""
+  },
+  "guests": [],
+  "participants": [],
+  "budget": {
+    "income": [],
+    "expenses": []
+  },
+  "mail": {
+    "sender": ""
+  }
+}
