@@ -46,9 +46,16 @@ class EventPlannerApp:
         self.route_change(None)
 
     def route_change(self, _) -> None:
-        route = self.page.route or "/"
+        route = (self.page.route or "/").rstrip("/") or "/"
+        if route == "/events/add":
+            self.show_add_event_page()
+            return
         if route.startswith("/event/"):
-            event_id = route.removeprefix("/event/").strip("/")
+            parts = route.strip("/").split("/")
+            if len(parts) < 2:
+                self.page.go("/")
+                return
+            event_id = parts[1]
             event_data = next(
                 (
                     item
@@ -60,20 +67,58 @@ class EventPlannerApp:
             if event_data is None:
                 self.page.go("/")
                 return
+            if self.data is not event_data:
+                self.script_path = ""
+                self.password = ""
             self.data = event_data
-            self.script_path = ""
-            self.password = ""
-            self.show_workspace()
+            page_name = parts[2] if len(parts) >= 3 else "event"
+            sections = {
+                "event": 0,
+                "guests": 1,
+                "team": 2,
+                "budget": 3,
+                "mail": 4,
+            }
+            section = sections.get(page_name)
+            if section is None or len(parts) > 4:
+                self.page.go(f"/event/{event_id}")
+                return
+            if len(parts) == 4:
+                if parts[3] != "add" or page_name not in {
+                    "guests",
+                    "team",
+                    "budget",
+                }:
+                    self.page.go(f"/event/{event_id}")
+                    return
+                add_views = {
+                    "guests": lambda: self.person_add_view("guests", False),
+                    "team": lambda: self.person_add_view("participants", True),
+                    "budget": self.budget_add_view,
+                }
+                self.show_workspace(section, add_views[page_name]())
+                return
+            self.show_workspace(section)
             return
         if route != "/":
             self.page.go("/")
             return
         self.show_event_selector()
 
-    def show_workspace(self) -> None:
+    def event_route(self, section: str = "") -> str:
+        base = f"/event/{self.data['id']}"
+        return f"{base}/{section}" if section else base
+
+    def go_to_section(self, index: int) -> None:
+        sections = ("", "guests", "team", "budget", "mail")
+        self.page.go(self.event_route(sections[index]))
+
+    def show_workspace(
+        self, selected_index: int = 0, controls: list[ft.Control] | None = None
+    ) -> None:
         rail = ft.NavigationRail(
             bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
-            selected_index=0,
+            selected_index=selected_index,
             label_type=ft.NavigationRailLabelType.ALL,
             destinations=[
                 ft.NavigationRailDestination(icon=ft.Icons.EVENT, label="Событие"),
@@ -82,7 +127,7 @@ class EventPlannerApp:
                 ft.NavigationRailDestination(icon=ft.Icons.ACCOUNT_BALANCE_WALLET, label="Бюджет"),
                 ft.NavigationRailDestination(icon=ft.Icons.MAIL, label="Рассылка"),
             ],
-            on_change=lambda e: self.show(int(e.control.selected_index)),
+            on_change=lambda e: self.go_to_section(int(e.control.selected_index)),
         )
         self.page.clean()
         self.page.add(
@@ -111,7 +156,11 @@ class EventPlannerApp:
                 spacing=0,
             )
         )
-        self.show(0)
+        if controls is None:
+            self.show(selected_index)
+        else:
+            self.content.controls = controls
+            self.page.update()
 
     def show_event_selector(self) -> None:
         self.data = None
@@ -162,7 +211,7 @@ class EventPlannerApp:
                 )
             )
         empty = ft.Text(
-            "Мероприятий пока нет. Создайте первое.",
+            "Мероприятий пока нет. Добавьте первое.",
             italic=True,
             color=ft.Colors.ON_SURFACE_VARIANT,
         )
@@ -177,9 +226,9 @@ class EventPlannerApp:
                         ),
                         ft.Text("Выберите мероприятие для редактирования"),
                         ft.Button(
-                            "Создать мероприятие",
+                            "Добавить мероприятие",
                             icon=ft.Icons.ADD,
-                            on_click=self.open_create_dialog,
+                            on_click=lambda _: self.page.go("/events/add"),
                         ),
                         ft.Divider(),
                         ft.Row(cards, wrap=True) if cards else empty,
@@ -195,12 +244,20 @@ class EventPlannerApp:
         event_id = event.control.data
         self.page.go(f"/event/{event_id}")
 
-    def open_create_dialog(self, _) -> None:
-        name = ft.TextField(label="Название", autofocus=True)
-        date = ft.TextField(label="Дата (ДД.ММ.ГГГГ)")
-        place = ft.TextField(label="Место проведения")
+    def show_add_event_page(self) -> None:
+        self.data = None
+        self.page.clean()
+        name = ft.TextField(
+            label="Название", autofocus=True, col={"xs": 12, "md": 8}
+        )
+        date = ft.TextField(
+            label="Дата (ДД.ММ.ГГГГ)", col={"xs": 12, "md": 4}
+        )
+        place = ft.TextField(
+            label="Место проведения", col={"xs": 12}
+        )
         description = ft.TextField(
-            label="Описание", multiline=True, min_lines=2
+            label="Описание", multiline=True, min_lines=2, col={"xs": 12}
         )
 
         def create(_):
@@ -218,9 +275,8 @@ class EventPlannerApp:
                 }
                 self.store["events"].append(event_data)
                 self.storage.save(self.store)
-                self.page.pop_dialog()
                 self.page.go(f"/event/{event_data['id']}")
-                self.notice("Мероприятие создано")
+                self.notice("Мероприятие добавлено")
             except ValueError as error:
                 message = (
                     "Дата должна быть в формате ДД.ММ.ГГГГ"
@@ -229,19 +285,48 @@ class EventPlannerApp:
                 )
                 self.notice(message, True)
 
-        self.page.show_dialog(
-            ft.AlertDialog(
-                modal=True,
-                title=ft.Text("Новое мероприятие"),
-                content=ft.Column(
-                    [name, date, place, description], tight=True, width=440
+        self.page.add(
+            ft.Container(
+                ft.Column(
+                    self.header(
+                        "Добавить мероприятие",
+                        "Заполните основную информацию",
+                    )
+                    + [
+                        ft.ResponsiveRow(
+                            [
+                                name,
+                                date,
+                                place,
+                                description,
+                            ],
+                            spacing=16,
+                            run_spacing=20,
+                        ),
+                        ft.Row(
+                            [
+                                ft.Button(
+                                    "Назад",
+                                    icon=ft.Icons.ARROW_BACK,
+                                    on_click=lambda _: self.page.go("/"),
+                                ),
+                                ft.Button(
+                                    "Добавить",
+                                    icon=ft.Icons.ADD,
+                                    on_click=create,
+                                ),
+                            ]
+                        ),
+                    ],
+                    width=900,
+                    spacing=20,
+                    scroll=ft.ScrollMode.AUTO,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                 ),
-                actions=[
-                    ft.Button(
-                        "Отмена", on_click=lambda _: self.page.pop_dialog()
-                    ),
-                    ft.Button("Создать", icon=ft.Icons.ADD, on_click=create),
-                ],
+                padding=32,
+                expand=True,
+                alignment=ft.Alignment.CENTER,
             )
         )
 
@@ -346,10 +431,20 @@ class EventPlannerApp:
         )
         return self.header("Мероприятие", "Основная информация для писем") + [form]
 
-    def person_form(self, target: str, role_required: bool) -> ft.Control:
-        name = ft.TextField(label="ФИО", expand=True)
-        email = ft.TextField(label="Email", expand=True)
-        role = ft.TextField(label="Роль", expand=True) if role_required else None
+    def person_add_view(
+        self, target: str, role_required: bool
+    ) -> list[ft.Control]:
+        name = ft.TextField(label="ФИО", autofocus=True, col={"xs": 12, "md": 6})
+        email = ft.TextField(label="Email", col={"xs": 12, "md": 6})
+        role = (
+            ft.TextField(label="Роль", col={"xs": 12, "md": 6})
+            if role_required
+            else None
+        )
+        section = "team" if role_required else "guests"
+        success_message = (
+            "Участник добавлен" if role_required else "Гость добавлен"
+        )
 
         def add(_):
             try:
@@ -365,12 +460,39 @@ class EventPlannerApp:
                     row["role"] = role.value.strip()
                 self.data[target].append(row)
                 self.storage.save(self.store)
-                self.show(2 if role_required else 1)
+                self.page.go(self.event_route(section))
+                self.notice(success_message)
             except ValueError as error:
                 self.notice(str(error), True)
 
         controls = [name, email] + ([role] if role else [])
-        return ft.Row(controls + [ft.IconButton(ft.Icons.ADD_CIRCLE, on_click=add)])
+        title = "Добавить участника" if role_required else "Добавить гостя"
+        subtitle = (
+            "Укажите контакты и роль в команде"
+            if role_required
+            else "Укажите имя и email получателя приглашения"
+        )
+        form = ft.Column(
+            [
+                ft.ResponsiveRow(controls, spacing=16, run_spacing=20),
+                ft.Row(
+                    [
+                        ft.Button(
+                            "Назад",
+                            icon=ft.Icons.ARROW_BACK,
+                            on_click=lambda _: self.page.go(
+                                self.event_route(section)
+                            ),
+                        ),
+                        ft.Button("Добавить", icon=ft.Icons.ADD, on_click=add),
+                    ]
+                ),
+            ],
+            width=900,
+            spacing=20,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        )
+        return self.header(title, subtitle) + [form]
 
     def people_table(self, target: str, role_required: bool) -> ft.Control:
         if not self.data[target]:
@@ -393,27 +515,41 @@ class EventPlannerApp:
         self.storage.save(self.store)
         self.show(section)
 
+    def people_section(self, target: str, role_required: bool) -> ft.ExpansionTile:
+        title = "Список участников" if role_required else "Список гостей"
+        return ft.ExpansionTile(
+            title=ft.Text(f"{title} ({len(self.data[target])})"),
+            leading=ft.Icons.GROUP,
+            controls=[self.people_table(target, role_required)],
+            controls_padding=16,
+            expanded_cross_axis_alignment=ft.CrossAxisAlignment.STRETCH,
+            expanded=True,
+            maintain_state=True,
+        )
+
     def guests_view(self) -> list[ft.Control]:
-        return self.header("Гости", "Получатели приглашений") + [self.person_form("guests", False), self.people_table("guests", False)]
+        return self.header("Гости", "Получатели приглашений") + [
+            ft.Button(
+                "Добавить гостя",
+                icon=ft.Icons.PERSON_ADD,
+                on_click=lambda _: self.page.go(
+                    self.event_route("guests/add")
+                ),
+            ),
+            self.people_section("guests", False),
+        ]
 
     def team_view(self) -> list[ft.Control]:
-        return self.header("Команда", "Участники и распределённые роли") + [self.person_form("participants", True), self.people_table("participants", True)]
+        return self.header("Команда", "Участники и распределённые роли") + [
+            ft.Button(
+                "Добавить участника",
+                icon=ft.Icons.PERSON_ADD,
+                on_click=lambda _: self.page.go(self.event_route("team/add")),
+            ),
+            self.people_section("participants", True),
+        ]
 
     def budget_view(self) -> list[ft.Control]:
-        title = ft.TextField(label="Статья", expand=True)
-        amount = ft.TextField(label="Сумма, ₽", width=170, keyboard_type=ft.KeyboardType.NUMBER)
-        kind = ft.Dropdown(label="Тип", value="expenses", width=170, options=[ft.DropdownOption(key="income", text="Доход"), ft.DropdownOption(key="expenses", text="Расход")])
-
-        def add(_):
-            try:
-                if not title.value.strip():
-                    raise ValueError("Введите название статьи")
-                self.data["budget"][kind.value].append({"id": uuid4().hex, "title": title.value.strip(), "amount": parse_amount(amount.value)})
-                self.storage.save(self.store)
-                self.show(3)
-            except ValueError as error:
-                self.notice(str(error), True)
-
         income, expenses, balance = budget_totals(self.data["budget"])
         cards = ft.Row(
             [
@@ -433,7 +569,80 @@ class EventPlannerApp:
             for row in self.data["budget"][key]:
                 rows.append(ft.DataRow(cells=[ft.DataCell(ft.Text(label)), ft.DataCell(ft.Text(row["title"])), ft.DataCell(ft.Text(f"{row['amount']:,.2f} ₽")), ft.DataCell(ft.IconButton(ft.Icons.DELETE_OUTLINE, data=(key, row["id"]), on_click=self.delete_budget))]))
         table = ft.DataTable(columns=[ft.DataColumn(ft.Text("Тип")), ft.DataColumn(ft.Text("Статья")), ft.DataColumn(ft.Text("Сумма")), ft.DataColumn(ft.Text(""))], rows=rows) if rows else ft.Text("Статей пока нет", italic=True)
-        return self.header("Бюджет", "Автоматический контроль дефицита") + [cards, ft.Row([title, amount, kind, ft.IconButton(ft.Icons.ADD_CIRCLE, on_click=add)]), ft.Row([table], scroll=ft.ScrollMode.AUTO)]
+        return self.header("Бюджет", "Автоматический контроль дефицита") + [
+            cards,
+            ft.Button(
+                "Добавить статью",
+                icon=ft.Icons.ADD,
+                on_click=lambda _: self.page.go(
+                    self.event_route("budget/add")
+                ),
+            ),
+            ft.Row([table], scroll=ft.ScrollMode.AUTO),
+        ]
+
+    def budget_add_view(self) -> list[ft.Control]:
+        title = ft.TextField(
+            label="Статья", autofocus=True, col={"xs": 12, "md": 6}
+        )
+        amount = ft.TextField(
+            label="Сумма, ₽",
+            keyboard_type=ft.KeyboardType.NUMBER,
+            col={"xs": 12, "md": 3},
+        )
+        kind = ft.Dropdown(
+            label="Тип",
+            value="expenses",
+            col={"xs": 12, "md": 3},
+            options=[
+                ft.DropdownOption(key="income", text="Доход"),
+                ft.DropdownOption(key="expenses", text="Расход"),
+            ],
+        )
+
+        def add(_):
+            try:
+                if not title.value.strip():
+                    raise ValueError("Введите название статьи")
+                self.data["budget"][kind.value].append(
+                    {
+                        "id": uuid4().hex,
+                        "title": title.value.strip(),
+                        "amount": parse_amount(amount.value),
+                    }
+                )
+                self.storage.save(self.store)
+                self.page.go(self.event_route("budget"))
+                self.notice("Статья бюджета добавлена")
+            except ValueError as error:
+                self.notice(str(error), True)
+
+        form = ft.Column(
+            [
+                ft.ResponsiveRow(
+                    [title, amount, kind], spacing=16, run_spacing=20
+                ),
+                ft.Row(
+                    [
+                        ft.Button(
+                            "Назад",
+                            icon=ft.Icons.ARROW_BACK,
+                            on_click=lambda _: self.page.go(
+                                self.event_route("budget")
+                            ),
+                        ),
+                        ft.Button("Добавить", icon=ft.Icons.ADD, on_click=add),
+                    ]
+                ),
+            ],
+            width=900,
+            spacing=20,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        )
+        return self.header(
+            "Добавить статью бюджета",
+            "Укажите тип, название и сумму",
+        ) + [form]
 
     @staticmethod
     def metric(label: str, value: float, color, text_color) -> ft.Control:
