@@ -668,19 +668,16 @@ class EventPlannerApp:
                 script.value = self.script_path
                 self.page.update()
 
-        def remember():
-            self.data["mail"]["sender"] = sender.value.strip()
-            self.password = password.value
-            self.script_path = script.value.strip()
-            self.storage.save(self.store)
-
         def send(target: str):
-            remember()
             try:
                 people = self.data[target]
                 if not people:
                     raise ValueError("Список получателей пуст")
-                service = MailService(sender.value, self.password)
+                service = MailService(sender.value, password.value)
+                self.data["mail"]["sender"] = service.sender
+                self.password = password.value
+                self.script_path = script.value.strip()
+                self.storage.save(self.store)
                 count = service.send_invitations(people, self.data["event"]) if target == "guests" else service.send_participant_notices(people, self.data["event"], self.script_path)
                 self.notice(f"Отправлено писем: {count}")
             except Exception as error:

@@ -2,14 +2,39 @@ from pathlib import Path
 from typing import Iterable
 
 import yagmail
-from email_validator import EmailNotValidError, validate_email
+from email_validator import (
+    EmailSyntaxError,
+    EmailUndeliverableError,
+    validate_email,
+)
 
 
 def normalize_email(value: str) -> str:
+    if not value.strip():
+        raise ValueError("Введите email")
     try:
-        return validate_email(value.strip(), check_deliverability=False).normalized
-    except EmailNotValidError as error:
-        raise ValueError(str(error)) from error
+        result = validate_email(
+            value.strip(), check_deliverability=True, timeout=5
+        )
+        return result.normalized
+    except EmailSyntaxError as error:
+        raise ValueError("Email имеет неверный формат") from error
+    except EmailUndeliverableError as error:
+        raise ValueError(
+            "Почтовый домен не существует или не принимает письма"
+        ) from error
+
+
+def validate_recipients(recipients: Iterable[dict]) -> list[dict]:
+    validated = []
+    for person in recipients:
+        try:
+            email = normalize_email(person.get("email", ""))
+        except ValueError as error:
+            name = person.get("name") or "без имени"
+            raise ValueError(f"Проверьте email для «{name}»: {error}") from error
+        validated.append({**person, "email": email})
+    return validated
 
 
 def parse_amount(value: str) -> float:
@@ -37,7 +62,7 @@ class MailService:
 
     def send_invitations(self, recipients: Iterable[dict], event: dict) -> int:
         count = 0
-        for person in recipients:
+        for person in validate_recipients(recipients):
             message = (
                 f"Здравствуйте, {person['name']}!\n\n"
                 f"Приглашаем вас на мероприятие «{event.get('name') or 'Без названия'}».\n"
@@ -54,7 +79,7 @@ class MailService:
         if not script.is_file():
             raise ValueError("Файл сценария не найден")
         count = 0
-        for person in recipients:
+        for person in validate_recipients(recipients):
             message = (
                 f"Здравствуйте, {person['name']}!\n\n"
                 f"Вы участвуете в мероприятии «{event.get('name') or 'Без названия'}».\n"
@@ -64,4 +89,3 @@ class MailService:
             self.smtp.send(person["email"], f"Роль и сценарий: {event.get('name')}", [message, str(script.resolve())])
             count += 1
         return count
-
