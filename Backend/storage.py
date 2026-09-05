@@ -4,6 +4,8 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
+from Backend.mailing import mail_settings
+
 
 DEFAULT_EVENT = {
     "id": "",
@@ -11,7 +13,7 @@ DEFAULT_EVENT = {
     "guests": [],
     "participants": [],
     "budget": {"income": [], "expenses": []},
-    "mail": {"sender": ""},
+    "mail": mail_settings({}),
 }
 
 DEFAULT_DATA = {"events": []}
@@ -50,6 +52,7 @@ class JsonStorage:
                         if isinstance(value, type(default)):
                             event_data[key] = value
                     event_data["id"] = event_data["id"] or uuid4().hex
+                    event_data["mail"] = mail_settings(event_data["mail"])
                     result["events"].append(event_data)
             if migrated:
                 self.save(result)

@@ -6,6 +6,8 @@ import flet as ft
 
 from Backend.services import MailService, budget_totals, normalize_email, parse_amount
 from Backend.storage import DEFAULT_EVENT, JsonStorage
+from Backend.mailing import DEFAULT_TEMPLATES, MAIL_PROVIDERS, mail_settings, render_mail
+from Frontend.mail_help import MAIL_HELP
 
 
 class EventPlannerApp:
@@ -17,6 +19,7 @@ class EventPlannerApp:
         self.content = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO)
         self.password = ""
         self.script_path = ""
+        self.mail_picker = None
 
     def build(self) -> None:
         self.page.title = "Организатор мероприятий"
@@ -523,7 +526,7 @@ class EventPlannerApp:
             controls=[self.people_table(target, role_required)],
             controls_padding=16,
             expanded_cross_axis_alignment=ft.CrossAxisAlignment.STRETCH,
-            expanded=True,
+            expanded=False,
             maintain_state=True,
         )
 
@@ -655,14 +658,100 @@ class EventPlannerApp:
         self.show(3)
 
     def mail_view(self) -> list[ft.Control]:
-        sender = ft.TextField(label="Email отправителя (Gmail)", value=self.data["mail"].get("sender", ""), expand=True)
-        password = ft.TextField(label="Пароль приложения", password=True, can_reveal_password=True, expand=True)
+        settings = mail_settings(self.data["mail"])
+        provider = ft.Dropdown(
+            label="Почтовый сервис", value=settings["provider"],
+            options=[ft.DropdownOption(key=key, text=item["name"]) for key, item in MAIL_PROVIDERS.items()],
+            col={"xs": 12, "md": 4},
+        )
+        sender = ft.TextField(label="Email отправителя", value=settings["sender"], col={"xs": 12, "md": 8})
+        password = ft.TextField(label="Пароль приложения", value=self.password, password=True, can_reveal_password=True)
         script = ft.TextField(label="Файл сценария", value=self.script_path, read_only=True, expand=True)
-        picker = ft.FilePicker()
-        self.page.services.append(picker)
+        if self.mail_picker is None:
+            self.mail_picker = ft.FilePicker()
+            self.page.services.append(self.mail_picker)
+
+        editors = {}
+
+        def current_template(target):
+            subject, body = editors[target]
+            return {"subject": subject.value, "body": body.value}
+
+        def preview_person(target):
+            return next(iter(self.data[target]), {"name": "Иван Иванов", "email": "ivan@example.com", "role": "Ведущий"})
+
+        def persist():
+            templates = {target: current_template(target) for target in editors}
+            for target, template in templates.items():
+                render_mail(template, preview_person(target), self.data["event"])
+            self.data["mail"] = {
+                "sender": sender.value.strip(), "provider": provider.value,
+                "templates": templates,
+            }
+            self.storage.save(self.store)
+            self.password = password.value
+
+        def save(_):
+            try:
+                persist()
+                self.notice("Настройки и тексты писем сохранены")
+            except (ValueError, OSError) as error:
+                self.notice(str(error), True)
+
+        def preview(target):
+            try:
+                subject, body = render_mail(current_template(target), preview_person(target), self.data["event"])
+                self.page.show_dialog(ft.AlertDialog(
+                    title=ft.Text("Предпросмотр письма"),
+                    content=ft.Column([
+                        ft.Text("Данные первого получателя; если список пуст — пример."),
+                        ft.Text(f"Тема: {subject}", weight=ft.FontWeight.BOLD, selectable=True),
+                        ft.Text(body, selectable=True),
+                        ft.Text("Вложение: " + (script.value or "файл не выбран")) if target == "participants" else ft.Text("Без вложений"),
+                    ], width=650, tight=True, scroll=ft.ScrollMode.AUTO),
+                    actions=[ft.Button("Закрыть", on_click=lambda _: self.page.pop_dialog())],
+                ))
+            except ValueError as error:
+                self.notice(str(error), True)
+
+        def reset(target):
+            subject, body = editors[target]
+            subject.value = DEFAULT_TEMPLATES[target]["subject"]
+            body.value = DEFAULT_TEMPLATES[target]["body"]
+            self.page.update()
+
+        template_sections = []
+        for target, title in (("guests", "Письмо гостям"), ("participants", "Письмо команде")):
+            template = settings["templates"][target]
+            subject = ft.TextField(label="Тема письма", value=template["subject"])
+            body = ft.TextField(label="Текст письма", value=template["body"], multiline=True, min_lines=6, max_lines=16)
+            editors[target] = (subject, body)
+            template_sections.append(ft.ExpansionTile(
+                title=ft.Text(title), leading=ft.Icons.EDIT,
+                expanded=False, maintain_state=True, controls_padding=16,
+                expanded_cross_axis_alignment=ft.CrossAxisAlignment.STRETCH,
+                controls=[ft.Column([
+                    subject, body,
+                    ft.Text("Подстановки: {name} — ФИО, {email} — email, {event_name} — мероприятие, {date} — дата, {place} — место, {description} — описание, {role} — роль в команде. Для обычных фигурных скобок используйте {{ и }}."),
+                    ft.Row([
+                        ft.Button("Предпросмотр", icon=ft.Icons.VISIBILITY, on_click=lambda _, t=target: preview(t)),
+                        ft.Button("Стандартный текст", on_click=lambda _, t=target: reset(t)),
+                    ], wrap=True),
+                ], spacing=12)],
+            ))
+
+        help_text = ft.Markdown(MAIL_HELP[provider.value], selectable=True, auto_follow_links=True)
+
+        def provider_changed(_):
+            help_text.value = MAIL_HELP[provider.value]
+            password.value = ""
+            self.password = ""
+            self.page.update()
+
+        provider.on_select = provider_changed
 
         async def choose_file(_):
-            files = await picker.pick_files(dialog_title="Выберите сценарий", allow_multiple=False)
+            files = await self.mail_picker.pick_files(dialog_title="Выберите сценарий", allow_multiple=False)
             if files:
                 self.script_path = files[0].path
                 script.value = self.script_path
@@ -673,14 +762,32 @@ class EventPlannerApp:
                 people = self.data[target]
                 if not people:
                     raise ValueError("Список получателей пуст")
-                service = MailService(sender.value, password.value)
-                self.data["mail"]["sender"] = service.sender
-                self.password = password.value
+                persist()
+                service = MailService(sender.value, password.value, provider.value)
                 self.script_path = script.value.strip()
-                self.storage.save(self.store)
-                count = service.send_invitations(people, self.data["event"]) if target == "guests" else service.send_participant_notices(people, self.data["event"], self.script_path)
+                template = current_template(target)
+                count = service.send_invitations(people, self.data["event"], template) if target == "guests" else service.send_participant_notices(people, self.data["event"], self.script_path, template)
                 self.notice(f"Отправлено писем: {count}")
             except Exception as error:
                 self.notice(f"Ошибка рассылки: {error}", True)
 
-        return self.header("Рассылка", "Пароль приложения не сохраняется на диске") + [ft.Row([sender, password]), ft.Row([script, ft.Button("Выбрать файл", icon=ft.Icons.FOLDER_OPEN, on_click=choose_file)]), ft.Row([ft.Button("Пригласить гостей", icon=ft.Icons.SEND, on_click=lambda _: send("guests")), ft.Button("Уведомить команду", icon=ft.Icons.ATTACH_EMAIL, on_click=lambda _: send("participants"))], wrap=True)]
+        return self.header("Рассылка", "Тексты сохраняются отдельно для каждого мероприятия. Пароль приложения не сохраняется на диске.") + [
+            ft.ResponsiveRow([sender, provider]), password,
+            ft.ExpansionTile(
+                title=ft.Text("Инструкция для выбранного почтового сервиса"),
+                leading=ft.Icons.HELP_OUTLINE, expanded=False, maintain_state=True,
+                controls=[help_text], controls_padding=16,
+                expanded_cross_axis_alignment=ft.CrossAxisAlignment.STRETCH,
+            ),
+            *template_sections,
+            ft.Button("Сохранить настройки и тексты", icon=ft.Icons.SAVE, on_click=save),
+            ft.Text("Перед выходом из раздела сохраните изменения. При отправке тексты сохраняются автоматически."),
+            ft.Divider(),
+            ft.Text("Отправка", size=22, weight=ft.FontWeight.BOLD),
+            ft.Text("Сценарий прикладывается только к письмам команды."),
+            ft.Row([script, ft.Button("Выбрать файл", icon=ft.Icons.FOLDER_OPEN, on_click=choose_file)]),
+            ft.Row([
+                ft.Button("Пригласить гостей", icon=ft.Icons.SEND, on_click=lambda _: send("guests")),
+                ft.Button("Уведомить команду", icon=ft.Icons.ATTACH_EMAIL, on_click=lambda _: send("participants")),
+            ], wrap=True),
+        ]

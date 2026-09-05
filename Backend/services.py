@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Iterable
 
 import yagmail
+from Backend.mailing import DEFAULT_TEMPLATES, MAIL_PROVIDERS, render_mail
 from email_validator import (
     EmailSyntaxError,
     EmailUndeliverableError,
@@ -54,38 +55,43 @@ def budget_totals(budget: dict) -> tuple[float, float, float]:
 
 
 class MailService:
-    def __init__(self, sender: str, app_password: str) -> None:
+    def __init__(self, sender: str, app_password: str, provider: str = "gmail") -> None:
+        if provider not in MAIL_PROVIDERS:
+            raise ValueError("Выберите поддерживаемый почтовый сервис")
         self.sender = normalize_email(sender)
-        if not app_password:
+        if not app_password or not app_password.strip():
             raise ValueError("Введите пароль приложения почты")
-        self.smtp = yagmail.SMTP(self.sender, app_password)
+        self.smtp = yagmail.SMTP(
+            self.sender, app_password.strip(), host=MAIL_PROVIDERS[provider]["host"],
+            port=465, smtp_ssl=True, smtp_starttls=False, timeout=30,
+        )
 
-    def send_invitations(self, recipients: Iterable[dict], event: dict) -> int:
-        count = 0
-        for person in validate_recipients(recipients):
-            message = (
-                f"Здравствуйте, {person['name']}!\n\n"
-                f"Приглашаем вас на мероприятие «{event.get('name') or 'Без названия'}».\n"
-                f"Дата: {event.get('date') or 'уточняется'}\n"
-                f"Место: {event.get('place') or 'уточняется'}\n\n"
-                f"{event.get('description', '')}"
-            )
-            self.smtp.send(person["email"], f"Приглашение: {event.get('name')}", message)
-            count += 1
-        return count
+    def send_invitations(self, recipients: Iterable[dict], event: dict, template: dict | None = None) -> int:
+        return self._send(recipients, event, template if template is not None else DEFAULT_TEMPLATES["guests"])
 
-    def send_participant_notices(self, recipients: Iterable[dict], event: dict, script_path: str) -> int:
+    def send_participant_notices(self, recipients: Iterable[dict], event: dict, script_path: str, template: dict | None = None) -> int:
         script = Path(script_path)
         if not script.is_file():
             raise ValueError("Файл сценария не найден")
+        return self._send(
+            recipients, event, template if template is not None else DEFAULT_TEMPLATES["participants"],
+            attachments=[str(script.resolve())],
+        )
+
+    def _send(self, recipients: Iterable[dict], event: dict, template: dict, attachments: list[str] | None = None) -> int:
+        # Validate every message before sending the first one.
+        messages = [
+            (person["email"], *render_mail(template, person, event))
+            for person in validate_recipients(recipients)
+        ]
         count = 0
-        for person in validate_recipients(recipients):
-            message = (
-                f"Здравствуйте, {person['name']}!\n\n"
-                f"Вы участвуете в мероприятии «{event.get('name') or 'Без названия'}».\n"
-                f"Ваша роль: {person['role']}.\nДата: {event.get('date') or 'уточняется'}.\n"
-                "Сценарий находится во вложении."
-            )
-            self.smtp.send(person["email"], f"Роль и сценарий: {event.get('name')}", [message, str(script.resolve())])
-            count += 1
+        try:
+            for email, subject, message in messages:
+                # A user-entered path or HTML must remain literal message text.
+                self.smtp.send(email, subject, yagmail.raw(message), attachments=attachments)
+                count += 1
+        except Exception as error:
+            raise RuntimeError(f"Отправлено писем: {count} из {len(messages)}. {error}") from error
+        finally:
+            self.smtp.close()
         return count
