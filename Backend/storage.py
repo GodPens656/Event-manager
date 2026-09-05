@@ -2,15 +2,19 @@ import json
 from copy import deepcopy
 from pathlib import Path
 from threading import RLock
+from uuid import uuid4
 
 
-DEFAULT_DATA = {
+DEFAULT_EVENT = {
+    "id": "",
     "event": {"name": "", "date": "", "place": "", "description": ""},
     "guests": [],
     "participants": [],
     "budget": {"income": [], "expenses": []},
     "mail": {"sender": ""},
 }
+
+DEFAULT_DATA = {"events": []}
 
 
 class JsonStorage:
@@ -28,10 +32,27 @@ class JsonStorage:
                     raw = json.load(file)
             except (OSError, json.JSONDecodeError):
                 raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+
+            # Старый формат содержал одно мероприятие в корне файла. При
+            # первом запуске новой версии переносим его в список без потерь.
+            migrated = "events" not in raw and "event" in raw
+            raw_events = [raw] if migrated else raw.get("events", [])
             result = deepcopy(DEFAULT_DATA)
-            for key, default in result.items():
-                if key in raw and isinstance(raw[key], type(default)):
-                    result[key] = raw[key]
+            if isinstance(raw_events, list):
+                for raw_event in raw_events:
+                    if not isinstance(raw_event, dict):
+                        continue
+                    event_data = deepcopy(DEFAULT_EVENT)
+                    for key, default in event_data.items():
+                        value = raw_event.get(key)
+                        if isinstance(value, type(default)):
+                            event_data[key] = value
+                    event_data["id"] = event_data["id"] or uuid4().hex
+                    result["events"].append(event_data)
+            if migrated:
+                self.save(result)
             return result
 
     def save(self, data: dict) -> None:
@@ -40,4 +61,3 @@ class JsonStorage:
             with temporary.open("w", encoding="utf-8") as file:
                 json.dump(data, file, ensure_ascii=False, indent=2)
             temporary.replace(self.path)
-

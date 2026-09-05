@@ -1,17 +1,19 @@
+from copy import deepcopy
 from datetime import datetime
 from uuid import uuid4
 
 import flet as ft
 
 from Backend.services import MailService, budget_totals, normalize_email, parse_amount
-from Backend.storage import JsonStorage
+from Backend.storage import DEFAULT_EVENT, JsonStorage
 
 
 class EventPlannerApp:
     def __init__(self, page: ft.Page) -> None:
         self.page = page
         self.storage = JsonStorage()
-        self.data = self.storage.load()
+        self.store = self.storage.load()
+        self.data = None
         self.content = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO)
         self.password = ""
         self.script_path = ""
@@ -20,6 +22,35 @@ class EventPlannerApp:
         self.page.title = "Организатор мероприятий"
         self.page.theme = ft.Theme(color_scheme_seed=ft.Colors.INDIGO)
         self.page.padding = 0
+        self.page.on_route_change = self.route_change
+        self.route_change(None)
+
+    def route_change(self, _) -> None:
+        route = self.page.route or "/"
+        if route.startswith("/event/"):
+            event_id = route.removeprefix("/event/").strip("/")
+            event_data = next(
+                (
+                    item
+                    for item in self.store["events"]
+                    if item["id"] == event_id
+                ),
+                None,
+            )
+            if event_data is None:
+                self.page.go("/")
+                return
+            self.data = event_data
+            self.script_path = ""
+            self.password = ""
+            self.show_workspace()
+            return
+        if route != "/":
+            self.page.go("/")
+            return
+        self.show_event_selector()
+
+    def show_workspace(self) -> None:
         rail = ft.NavigationRail(
             selected_index=0,
             label_type=ft.NavigationRailLabelType.ALL,
@@ -32,8 +63,214 @@ class EventPlannerApp:
             ],
             on_change=lambda e: self.show(int(e.control.selected_index)),
         )
-        self.page.add(ft.Row([ft.Container(rail, bgcolor=ft.Colors.INDIGO_50, padding=10), ft.VerticalDivider(width=1), ft.Container(self.content, expand=True, padding=28)], expand=True, spacing=0))
+        self.page.clean()
+        self.page.add(
+            ft.Row(
+                [
+                    ft.Container(
+                        ft.Column(
+                            [
+                                ft.Container(rail, expand=True),
+                                ft.Divider(),
+                                ft.Button(
+                                    "Другие мероприятия",
+                                    icon=ft.Icons.SWAP_HORIZ,
+                                    on_click=lambda _: self.page.go("/"),
+                                ),
+                            ],
+                            expand=True,
+                        ),
+                        bgcolor=ft.Colors.INDIGO_50,
+                        padding=10,
+                    ),
+                    ft.VerticalDivider(width=1),
+                    ft.Container(self.content, expand=True, padding=28),
+                ],
+                expand=True,
+                spacing=0,
+            )
+        )
         self.show(0)
+
+    def show_event_selector(self) -> None:
+        self.data = None
+        self.page.clean()
+        cards = []
+        for event_data in self.store["events"]:
+            event = event_data["event"]
+            cards.append(
+                ft.Card(
+                    content=ft.Container(
+                        ft.Column(
+                            [
+                                ft.Text(
+                                    event["name"] or "Без названия",
+                                    size=20,
+                                    weight=ft.FontWeight.BOLD,
+                                ),
+                                ft.Text(
+                                    event["date"] or "Дата не указана",
+                                    color=ft.Colors.GREY_700,
+                                ),
+                                ft.Text(
+                                    event["place"] or "Место не указано",
+                                    color=ft.Colors.GREY_700,
+                                ),
+                                ft.Row(
+                                    [
+                                        ft.Button(
+                                            "Редактировать",
+                                            icon=ft.Icons.EDIT,
+                                            data=event_data["id"],
+                                            on_click=self.select_event,
+                                        ),
+                                        ft.IconButton(
+                                            icon=ft.Icons.DELETE_OUTLINE,
+                                            icon_color=ft.Colors.RED_700,
+                                            tooltip="Удалить мероприятие",
+                                            data=event_data["id"],
+                                            on_click=self.open_delete_dialog,
+                                        ),
+                                    ]
+                                ),
+                            ]
+                        ),
+                        padding=18,
+                        width=300,
+                    )
+                )
+            )
+        empty = ft.Text(
+            "Мероприятий пока нет. Создайте первое.",
+            italic=True,
+            color=ft.Colors.GREY_700,
+        )
+        self.page.add(
+            ft.Container(
+                ft.Column(
+                    [
+                        ft.Text(
+                            "Организатор мероприятий",
+                            size=34,
+                            weight=ft.FontWeight.BOLD,
+                        ),
+                        ft.Text("Выберите мероприятие для редактирования"),
+                        ft.Button(
+                            "Создать мероприятие",
+                            icon=ft.Icons.ADD,
+                            on_click=self.open_create_dialog,
+                        ),
+                        ft.Divider(),
+                        ft.Row(cards, wrap=True) if cards else empty,
+                    ],
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+                padding=32,
+                expand=True,
+            )
+        )
+
+    def select_event(self, event) -> None:
+        event_id = event.control.data
+        self.page.go(f"/event/{event_id}")
+
+    def open_create_dialog(self, _) -> None:
+        name = ft.TextField(label="Название", autofocus=True)
+        date = ft.TextField(label="Дата (ДД.ММ.ГГГГ)")
+        place = ft.TextField(label="Место проведения")
+        description = ft.TextField(
+            label="Описание", multiline=True, min_lines=2
+        )
+
+        def create(_):
+            try:
+                if not name.value.strip():
+                    raise ValueError("Укажите название мероприятия")
+                datetime.strptime(date.value.strip(), "%d.%m.%Y")
+                event_data = deepcopy(DEFAULT_EVENT)
+                event_data["id"] = uuid4().hex
+                event_data["event"] = {
+                    "name": name.value.strip(),
+                    "date": date.value.strip(),
+                    "place": place.value.strip(),
+                    "description": description.value.strip(),
+                }
+                self.store["events"].append(event_data)
+                self.storage.save(self.store)
+                self.page.pop_dialog()
+                self.page.go(f"/event/{event_data['id']}")
+                self.notice("Мероприятие создано")
+            except ValueError as error:
+                message = (
+                    "Дата должна быть в формате ДД.ММ.ГГГГ"
+                    if "time data" in str(error)
+                    else str(error)
+                )
+                self.notice(message, True)
+
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Новое мероприятие"),
+                content=ft.Column(
+                    [name, date, place, description], tight=True, width=440
+                ),
+                actions=[
+                    ft.Button(
+                        "Отмена", on_click=lambda _: self.page.pop_dialog()
+                    ),
+                    ft.Button("Создать", icon=ft.Icons.ADD, on_click=create),
+                ],
+            )
+        )
+
+    def open_delete_dialog(self, event) -> None:
+        event_id = event.control.data
+        event_data = next(
+            (
+                item
+                for item in self.store["events"]
+                if item["id"] == event_id
+            ),
+            None,
+        )
+        if event_data is None:
+            self.notice("Мероприятие уже удалено", True)
+            return
+
+        def delete(_):
+            self.store["events"] = [
+                item
+                for item in self.store["events"]
+                if item["id"] != event_id
+            ]
+            self.storage.save(self.store)
+            self.page.pop_dialog()
+            self.show_event_selector()
+            self.notice("Мероприятие удалено")
+
+        name = event_data["event"]["name"] or "Без названия"
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Удалить мероприятие?"),
+                content=ft.Text(
+                    f"«{name}» и все связанные гости, участники и статьи "
+                    "бюджета будут удалены без возможности восстановления."
+                ),
+                actions=[
+                    ft.Button(
+                        "Отмена", on_click=lambda _: self.page.pop_dialog()
+                    ),
+                    ft.Button(
+                        "Удалить",
+                        icon=ft.Icons.DELETE,
+                        color=ft.Colors.RED_700,
+                        on_click=delete,
+                    ),
+                ],
+            )
+        )
 
     def show(self, index: int) -> None:
         views = (self.event_view, self.guests_view, self.team_view, self.budget_view, self.mail_view)
@@ -60,7 +297,7 @@ class EventPlannerApp:
                     raise ValueError("Укажите название")
                 datetime.strptime(date.value.strip(), "%d.%m.%Y")
                 self.data["event"] = {"name": name.value.strip(), "date": date.value.strip(), "place": place.value.strip(), "description": description.value.strip()}
-                self.storage.save(self.data)
+                self.storage.save(self.store)
                 self.notice("Мероприятие сохранено")
             except ValueError as error:
                 self.notice("Проверьте название и дату в формате ДД.ММ.ГГГГ" if "time data" in str(error) else str(error), True)
@@ -85,7 +322,7 @@ class EventPlannerApp:
                         raise ValueError("Укажите роль")
                     row["role"] = role.value.strip()
                 self.data[target].append(row)
-                self.storage.save(self.data)
+                self.storage.save(self.store)
                 self.show(2 if role_required else 1)
             except ValueError as error:
                 self.notice(str(error), True)
@@ -111,7 +348,7 @@ class EventPlannerApp:
 
     def delete_person(self, target: str, person_id: str, section: int) -> None:
         self.data[target] = [p for p in self.data[target] if p["id"] != person_id]
-        self.storage.save(self.data)
+        self.storage.save(self.store)
         self.show(section)
 
     def guests_view(self) -> list[ft.Control]:
@@ -130,7 +367,7 @@ class EventPlannerApp:
                 if not title.value.strip():
                     raise ValueError("Введите название статьи")
                 self.data["budget"][kind.value].append({"id": uuid4().hex, "title": title.value.strip(), "amount": parse_amount(amount.value)})
-                self.storage.save(self.data)
+                self.storage.save(self.store)
                 self.show(3)
             except ValueError as error:
                 self.notice(str(error), True)
@@ -151,7 +388,7 @@ class EventPlannerApp:
     def delete_budget(self, event) -> None:
         key, row_id = event.control.data
         self.data["budget"][key] = [x for x in self.data["budget"][key] if x["id"] != row_id]
-        self.storage.save(self.data)
+        self.storage.save(self.store)
         self.show(3)
 
     def mail_view(self) -> list[ft.Control]:
@@ -172,7 +409,7 @@ class EventPlannerApp:
             self.data["mail"]["sender"] = sender.value.strip()
             self.password = password.value
             self.script_path = script.value.strip()
-            self.storage.save(self.data)
+            self.storage.save(self.store)
 
         def send(target: str):
             remember()
@@ -187,4 +424,3 @@ class EventPlannerApp:
                 self.notice(f"Ошибка рассылки: {error}", True)
 
         return self.header("Рассылка", "Пароль приложения не сохраняется на диске") + [ft.Row([sender, password]), ft.Row([script, ft.Button("Выбрать файл", icon=ft.Icons.FOLDER_OPEN, on_click=choose_file)]), ft.Row([ft.Button("Пригласить гостей", icon=ft.Icons.SEND, on_click=lambda _: send("guests")), ft.Button("Уведомить команду", icon=ft.Icons.ATTACH_EMAIL, on_click=lambda _: send("participants"))], wrap=True)]
-
