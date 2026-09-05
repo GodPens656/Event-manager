@@ -315,8 +315,8 @@ class EventPlannerApp:
 
     def event_view(self) -> list[ft.Control]:
         item = self.data["event"]
-        name = ft.TextField(label="Название", value=item["name"], expand=True)
-        date = ft.TextField(label="Дата (ДД.ММ.ГГГГ)", value=item["date"], width=230)
+        name = ft.TextField(label="Название", value=item["name"], col={"xs": 12, "md": 8})
+        date = ft.TextField(label="Дата (ДД.ММ.ГГГГ)", value=item["date"], col={"xs": 12, "md": 4})
         place = ft.TextField(label="Место проведения", value=item["place"])
         description = ft.TextField(label="Описание", value=item["description"], multiline=True, min_lines=3)
 
@@ -331,7 +331,20 @@ class EventPlannerApp:
             except ValueError as error:
                 self.notice("Проверьте название и дату в формате ДД.ММ.ГГГГ" if "time data" in str(error) else str(error), True)
 
-        return self.header("Мероприятие", "Основная информация для писем") + [ft.Row([name, date]), place, description, ft.Button("Сохранить", icon=ft.Icons.SAVE, on_click=save)]
+        form = ft.Column(
+            [
+                ft.ResponsiveRow(
+                    [name, date, place, description],
+                    spacing=16,
+                    run_spacing=20,
+                ),
+                ft.Row([ft.Button("Сохранить", icon=ft.Icons.SAVE, on_click=save)]),
+            ],
+            width=900,
+            spacing=20,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        )
+        return self.header("Мероприятие", "Основная информация для писем") + [form]
 
     def person_form(self, target: str, role_required: bool) -> ft.Control:
         name = ft.TextField(label="ФИО", expand=True)
