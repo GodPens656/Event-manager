@@ -20,7 +20,27 @@ class EventPlannerApp:
 
     def build(self) -> None:
         self.page.title = "Организатор мероприятий"
-        self.page.theme = ft.Theme(color_scheme_seed=ft.Colors.INDIGO)
+        # Flet follows system changes without rebuilding forms or losing input.
+        self.page.theme_mode = ft.ThemeMode.SYSTEM
+        self.page.theme = ft.Theme(
+            color_scheme_seed=ft.Colors.INDIGO,
+            color_scheme=ft.ColorScheme(
+                tertiary="#256C2C",
+                on_tertiary="#FFFFFF",
+                tertiary_container="#B0F2AD",
+                on_tertiary_container="#002204",
+            ),
+        )
+        self.page.dark_theme = ft.Theme(
+            color_scheme_seed=ft.Colors.INDIGO,
+            color_scheme=ft.ColorScheme(
+                tertiary="#95D693",
+                on_tertiary="#00390A",
+                tertiary_container="#075319",
+                on_tertiary_container="#B0F2AD",
+            ),
+        )
+        self.page.bgcolor = ft.Colors.SURFACE
         self.page.padding = 0
         self.page.on_route_change = self.route_change
         self.route_change(None)
@@ -52,6 +72,7 @@ class EventPlannerApp:
 
     def show_workspace(self) -> None:
         rail = ft.NavigationRail(
+            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
             selected_index=0,
             label_type=ft.NavigationRailLabelType.ALL,
             destinations=[
@@ -80,7 +101,7 @@ class EventPlannerApp:
                             ],
                             expand=True,
                         ),
-                        bgcolor=ft.Colors.INDIGO_50,
+                        bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
                         padding=10,
                     ),
                     ft.VerticalDivider(width=1),
@@ -110,11 +131,11 @@ class EventPlannerApp:
                                 ),
                                 ft.Text(
                                     event["date"] or "Дата не указана",
-                                    color=ft.Colors.GREY_700,
+                                    color=ft.Colors.ON_SURFACE_VARIANT,
                                 ),
                                 ft.Text(
                                     event["place"] or "Место не указано",
-                                    color=ft.Colors.GREY_700,
+                                    color=ft.Colors.ON_SURFACE_VARIANT,
                                 ),
                                 ft.Row(
                                     [
@@ -126,7 +147,7 @@ class EventPlannerApp:
                                         ),
                                         ft.IconButton(
                                             icon=ft.Icons.DELETE_OUTLINE,
-                                            icon_color=ft.Colors.RED_700,
+                                            icon_color=ft.Colors.ERROR,
                                             tooltip="Удалить мероприятие",
                                             data=event_data["id"],
                                             on_click=self.open_delete_dialog,
@@ -143,7 +164,7 @@ class EventPlannerApp:
         empty = ft.Text(
             "Мероприятий пока нет. Создайте первое.",
             italic=True,
-            color=ft.Colors.GREY_700,
+            color=ft.Colors.ON_SURFACE_VARIANT,
         )
         self.page.add(
             ft.Container(
@@ -265,7 +286,7 @@ class EventPlannerApp:
                     ft.Button(
                         "Удалить",
                         icon=ft.Icons.DELETE,
-                        color=ft.Colors.RED_700,
+                        color=ft.Colors.ERROR,
                         on_click=delete,
                     ),
                 ],
@@ -278,11 +299,19 @@ class EventPlannerApp:
         self.page.update()
 
     def notice(self, message: str, error: bool = False) -> None:
-        self.page.show_dialog(ft.SnackBar(ft.Text(message), bgcolor=ft.Colors.RED_700 if error else ft.Colors.GREEN_700))
+        self.page.show_dialog(
+            ft.SnackBar(
+                ft.Text(
+                    message,
+                    color=ft.Colors.ON_ERROR_CONTAINER if error else ft.Colors.ON_TERTIARY_CONTAINER,
+                ),
+                bgcolor=ft.Colors.ERROR_CONTAINER if error else ft.Colors.TERTIARY_CONTAINER,
+            )
+        )
 
     @staticmethod
     def header(title: str, subtitle: str) -> list[ft.Control]:
-        return [ft.Text(title, size=30, weight=ft.FontWeight.BOLD), ft.Text(subtitle, color=ft.Colors.GREY_700), ft.Divider()]
+        return [ft.Text(title, size=30, weight=ft.FontWeight.BOLD), ft.Text(subtitle, color=ft.Colors.ON_SURFACE_VARIANT), ft.Divider()]
 
     def event_view(self) -> list[ft.Control]:
         item = self.data["event"]
@@ -332,7 +361,7 @@ class EventPlannerApp:
 
     def people_table(self, target: str, role_required: bool) -> ft.Control:
         if not self.data[target]:
-            return ft.Text("Список пока пуст", italic=True, color=ft.Colors.GREY)
+            return ft.Text("Список пока пуст", italic=True, color=ft.Colors.ON_SURFACE_VARIANT)
         columns = [ft.DataColumn(ft.Text("ФИО")), ft.DataColumn(ft.Text("Email"))]
         if role_required:
             columns.append(ft.DataColumn(ft.Text("Роль")))
@@ -373,7 +402,19 @@ class EventPlannerApp:
                 self.notice(str(error), True)
 
         income, expenses, balance = budget_totals(self.data["budget"])
-        cards = ft.Row([self.metric("Доходы", income, ft.Colors.GREEN_50), self.metric("Расходы", expenses, ft.Colors.RED_50), self.metric("Дефицит" if balance < 0 else "Остаток", abs(balance), ft.Colors.RED_100 if balance < 0 else ft.Colors.BLUE_50, ft.Colors.RED_700 if balance < 0 else ft.Colors.GREEN_700)], wrap=True)
+        cards = ft.Row(
+            [
+                self.metric("Доходы", income, ft.Colors.TERTIARY_CONTAINER, ft.Colors.ON_TERTIARY_CONTAINER),
+                self.metric("Расходы", expenses, ft.Colors.ERROR_CONTAINER, ft.Colors.ON_ERROR_CONTAINER),
+                self.metric(
+                    "Дефицит" if balance < 0 else "Остаток",
+                    abs(balance),
+                    ft.Colors.ERROR_CONTAINER if balance < 0 else ft.Colors.TERTIARY_CONTAINER,
+                    ft.Colors.ON_ERROR_CONTAINER if balance < 0 else ft.Colors.ON_TERTIARY_CONTAINER,
+                ),
+            ],
+            wrap=True,
+        )
         rows = []
         for key, label in (("income", "Доход"), ("expenses", "Расход")):
             for row in self.data["budget"][key]:
@@ -382,8 +423,8 @@ class EventPlannerApp:
         return self.header("Бюджет", "Автоматический контроль дефицита") + [cards, ft.Row([title, amount, kind, ft.IconButton(ft.Icons.ADD_CIRCLE, on_click=add)]), ft.Row([table], scroll=ft.ScrollMode.AUTO)]
 
     @staticmethod
-    def metric(label: str, value: float, color, text_color=None) -> ft.Control:
-        return ft.Container(ft.Column([ft.Text(label), ft.Text(f"{value:,.2f} ₽", size=23, weight=ft.FontWeight.BOLD, color=text_color)]), bgcolor=color, padding=18, border_radius=12, width=230)
+    def metric(label: str, value: float, color, text_color) -> ft.Control:
+        return ft.Container(ft.Column([ft.Text(label, color=text_color), ft.Text(f"{value:,.2f} ₽", size=23, weight=ft.FontWeight.BOLD, color=text_color)]), bgcolor=color, padding=18, border_radius=12, width=230)
 
     def delete_budget(self, event) -> None:
         key, row_id = event.control.data
