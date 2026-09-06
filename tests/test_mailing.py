@@ -10,7 +10,8 @@ import yagmail
 
 from Backend.mailing import DEFAULT_TEMPLATES, mail_settings, render_mail
 from Backend.services import MailService
-from Backend.storage import DEFAULT_EVENT, JsonStorage
+from Backend.storage import DEFAULT_EVENT, decode_data, encode_data, normalize_data
+from Backend.attachments import ScriptAttachment
 from Frontend.app import EventPlannerApp
 from Frontend.mail_help import MAIL_HELP
 
@@ -85,6 +86,23 @@ class MailTests(unittest.TestCase):
                 MailService("sender@example.com", "secret").send_participant_notices([self.person], self.event, str(Path(directory) / "missing.txt"))
         self.smtp.send.assert_not_called()
 
+    def test_memory_attachment_is_complete_for_every_recipient_and_closed(self):
+        streams = []
+
+        def consume(*args, **kwargs):
+            stream = kwargs["attachments"][0]
+            streams.append(stream)
+            self.assertEqual(stream.name, "scenario.pdf")
+            self.assertEqual(stream.read(), b"%PDF-memory")
+
+        self.smtp.send.side_effect = consume
+        count = MailService("sender@example.com", "secret").send_participant_notices(
+            [self.person, self.person], self.event, ScriptAttachment("scenario.pdf", b"%PDF-memory"),
+        )
+        self.assertEqual(count, 2)
+        self.assertEqual(len(streams), 2)
+        self.assertTrue(all(stream.closed for stream in streams))
+
     def test_all_messages_validated_before_first_send(self):
         people = [self.person, {**self.person, "name": "Invalid\nHeader"}]
         with self.assertRaises(ValueError):
@@ -102,15 +120,13 @@ class MailTests(unittest.TestCase):
             path = Path(directory) / "data.json"
             old = {"event": self.event, "mail": {"sender": "old@gmail.com"}}
             path.write_text(json.dumps(old), encoding="utf-8")
-            storage = JsonStorage(str(path))
-            data = storage.load()
+            data = normalize_data(json.loads(path.read_text(encoding="utf-8")))
             settings = data["events"][0]["mail"]
             self.assertEqual(settings["sender"], "old@gmail.com")
             self.assertEqual(settings["templates"], DEFAULT_TEMPLATES)
             settings["provider"] = "mailru"
             settings["templates"]["guests"]["body"] = "Свой текст"
-            storage.save(data)
-            self.assertEqual(storage.load(), data)
+            self.assertEqual(decode_data(encode_data(data)), data)
             self.assertNotEqual(DEFAULT_TEMPLATES["guests"]["body"], "Свой текст")
 
     def test_partial_mail_settings_keep_saved_fields(self):
@@ -120,17 +136,17 @@ class MailTests(unittest.TestCase):
         self.assertEqual(settings["templates"]["participants"], DEFAULT_TEMPLATES["participants"])
 
 
-class MailUiTests(unittest.TestCase):
+class MailUiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.page = Mock(services=[])
-        with patch("Frontend.app.JsonStorage"):
+        with patch("Frontend.app.BrowserStorage", autospec=True):
             self.app = EventPlannerApp(self.page)
         self.app.data = deepcopy(DEFAULT_EVENT)
         self.app.store = {"events": [self.app.data]}
         self.controls = self.app.mail_view()
         self.tiles = [c for c in self.controls if isinstance(c, ft.ExpansionTile)]
 
-    def test_edit_save_reload_preview_and_provider_help(self):
+    async def test_edit_save_reload_preview_and_provider_help(self):
         provider = self.controls[3].controls[1]
         password = self.controls[4]
         provider.value = "yandex"
@@ -145,15 +161,15 @@ class MailUiTests(unittest.TestCase):
         self.assertIn("Иван Иванов", self.page.show_dialog.call_args.args[0].content.controls[2].value)
         save_button = next(c for c in self.controls if isinstance(c, ft.Button) and c.content == "Сохранить настройки и тексты")
         password.value = "never-save-this"
-        save_button.on_click(None)
-        self.app.storage.save.assert_called_once_with(self.app.store)
+        await save_button.on_click(None)
+        self.app.storage.save.assert_awaited_once_with(self.app.store)
         self.assertEqual(self.app.data["mail"]["templates"]["guests"]["body"], "Добрый день, {name}!")
         self.assertNotIn("never-save-this", json.dumps(self.app.store))
         self.assertEqual(self.app.data["mail"]["provider"], "yandex")
         controls = self.app.mail_view()
         tiles = [c for c in controls if isinstance(c, ft.ExpansionTile)]
         self.assertEqual(tiles[1].controls[0].controls[0].value, "Новая тема")
-        self.assertEqual(len(self.page.services), 1)
+        self.assertEqual(len(self.page.services), 2)
 
 
 if __name__ == "__main__":

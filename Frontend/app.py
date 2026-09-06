@@ -1,11 +1,16 @@
+import asyncio
 from copy import deepcopy
 from datetime import datetime
 from uuid import uuid4
 
 import flet as ft
 
+from Backend.attachments import MAX_SCRIPT_BYTES, ScriptAttachment
 from Backend.services import MailService, budget_totals, normalize_email, parse_amount
-from Backend.storage import DEFAULT_EVENT, JsonStorage
+from Backend.storage import (
+    DEFAULT_DATA, DEFAULT_EVENT, MAX_DATA_BYTES, BrowserStorage, StorageConflict,
+    decode_data, encode_data,
+)
 from Backend.mailing import DEFAULT_TEMPLATES, MAIL_PROVIDERS, mail_settings, render_mail
 from Frontend.mail_help import MAIL_HELP
 
@@ -13,15 +18,50 @@ from Frontend.mail_help import MAIL_HELP
 class EventPlannerApp:
     def __init__(self, page: ft.Page) -> None:
         self.page = page
-        self.storage = JsonStorage()
-        self.store = self.storage.load()
+        self.preferences = ft.SharedPreferences()
+        self.page.services.append(self.preferences)
+        self.storage = BrowserStorage(self.preferences)
+        self.store = deepcopy(DEFAULT_DATA)
+        self._action_lock = asyncio.Lock()
+        self.backup_picker = None
         self.data = None
         self.content = ft.Column(expand=True, scroll=ft.ScrollMode.AUTO)
         self.password = ""
-        self.script_path = ""
+        self.script_attachment = None
         self.mail_picker = None
+        self.sending = False
+        self.send_buttons = []
+        self.sidebar = None
+        self.workspace_body = None
+        self.mobile_header = None
 
-    def build(self) -> None:
+    def clear_sensitive(self, _=None) -> None:
+        self.password = ""
+        self.script_attachment = None
+
+    def action(self, handler):
+        async def handle(event):
+            async with self._action_lock:
+                await handler(event)
+        return handle
+
+    async def save_store(self) -> bool:
+        try:
+            await self.storage.save(self.store)
+            return True
+        except StorageConflict as error:
+            self.page.pop_dialog()
+            await self.route_change(None)
+            self.notice(str(error), True)
+        except Exception as error:
+            # A failed browser write must not leave unsaved rows in session state.
+            event_id = self.data["id"] if self.data else None
+            self.store = self.storage.last_loaded()
+            self.data = next((item for item in self.store["events"] if item["id"] == event_id), None)
+            self.notice(f"Не удалось сохранить данные в браузере: {error}", True)
+        return False
+
+    async def build(self) -> None:
         self.page.title = "Организатор мероприятий"
         # Flet follows system changes without rebuilding forms or losing input.
         self.page.theme_mode = ft.ThemeMode.SYSTEM
@@ -45,10 +85,26 @@ class EventPlannerApp:
         )
         self.page.bgcolor = ft.Colors.SURFACE
         self.page.padding = 0
-        self.page.on_route_change = self.route_change
-        self.route_change(None)
+        self.page.on_route_change = self.action(self.route_change)
+        self.page.on_resize = self.resize_workspace
+        self.page.on_close = self.clear_sensitive
+        self.page.add(ft.Text("Загрузка данных из браузера…"), ft.ProgressRing())
+        await self.route_change(None)
 
-    def route_change(self, _) -> None:
+    async def route_change(self, _) -> None:
+        try:
+            self.store = await self.storage.load()
+        except Exception as error:
+            self.clear_workspace()
+            self.data = None
+            self.page.clean()
+            self.page.add(ft.Column([
+                ft.Text("Не удалось загрузить данные из браузера", size=24),
+                ft.Text(str(error)),
+                ft.Text("Разрешите хранение данных сайта и повторите попытку. Существующие данные не будут заменены."),
+                ft.Button("Повторить", on_click=self.action(self.route_change)),
+            ]))
+            return
         route = (self.page.route or "/").rstrip("/") or "/"
         if route == "/events/add":
             self.show_add_event_page()
@@ -70,9 +126,8 @@ class EventPlannerApp:
             if event_data is None:
                 self.page.go("/")
                 return
-            if self.data is not event_data:
-                self.script_path = ""
-                self.password = ""
+            if self.data is None or self.data["id"] != event_id:
+                self.clear_sensitive()
             self.data = event_data
             page_name = parts[2] if len(parts) >= 3 else "event"
             sections = {
@@ -108,6 +163,23 @@ class EventPlannerApp:
             return
         self.show_event_selector()
 
+    def resize_workspace(self, _=None) -> None:
+        if self.workspace_body is None:
+            return
+        compact = (self.page.width or 1024) < 760
+        self.sidebar.visible = not compact
+        self.mobile_header.visible = compact
+        self.page.navigation_bar.visible = compact
+        self.workspace_body.padding = 16 if compact else 28
+        self.page.update()
+
+    def clear_workspace(self) -> None:
+        self.sidebar = None
+        self.workspace_body = None
+        self.mobile_header = None
+        self.page.navigation_bar = None
+        self.clear_sensitive()
+
     def event_route(self, section: str = "") -> str:
         base = f"/event/{self.data['id']}"
         return f"{base}/{section}" if section else base
@@ -132,33 +204,46 @@ class EventPlannerApp:
             ],
             on_change=lambda e: self.go_to_section(int(e.control.selected_index)),
         )
-        self.page.clean()
-        self.page.add(
-            ft.Row(
+        self.sidebar = ft.Container(
+            ft.Column(
                 [
-                    ft.Container(
-                        ft.Column(
-                            [
-                                ft.Container(rail, expand=True),
-                                ft.Divider(),
-                                ft.Button(
-                                    "Другие мероприятия",
-                                    icon=ft.Icons.SWAP_HORIZ,
-                                    on_click=lambda _: self.page.go("/"),
-                                ),
-                            ],
-                            expand=True,
-                        ),
-                        bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
-                        padding=10,
+                    ft.Container(rail, expand=True),
+                    ft.Divider(),
+                    ft.Button(
+                        "Другие мероприятия",
+                        icon=ft.Icons.SWAP_HORIZ,
+                        on_click=lambda _: self.page.go("/"),
                     ),
-                    ft.VerticalDivider(width=1),
-                    ft.Container(self.content, expand=True, padding=28),
                 ],
                 expand=True,
-                spacing=0,
-            )
+            ),
+            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
+            padding=10,
         )
+        self.workspace_body = ft.Container(self.content, expand=True, padding=28)
+        self.mobile_header = ft.Row([
+            ft.TextButton("Все мероприятия", icon=ft.Icons.ARROW_BACK,
+                          on_click=lambda _: self.page.go("/")),
+        ])
+        self.page.navigation_bar = ft.NavigationBar(
+            selected_index=selected_index,
+            destinations=[
+                ft.NavigationBarDestination(icon=ft.Icons.EVENT, label="Событие"),
+                ft.NavigationBarDestination(icon=ft.Icons.PERSON_ADD, label="Гости"),
+                ft.NavigationBarDestination(icon=ft.Icons.GROUP, label="Команда"),
+                ft.NavigationBarDestination(icon=ft.Icons.ACCOUNT_BALANCE_WALLET, label="Бюджет"),
+                ft.NavigationBarDestination(icon=ft.Icons.MAIL, label="Рассылка"),
+            ],
+            on_change=lambda e: self.go_to_section(int(e.control.selected_index)),
+        )
+        self.page.clean()
+        self.page.add(
+            ft.Column([
+                self.mobile_header,
+                ft.Row([self.sidebar, self.workspace_body], expand=True, spacing=0),
+            ], expand=True, spacing=0)
+        )
+        self.resize_workspace()
         if controls is None:
             self.show(selected_index)
         else:
@@ -167,12 +252,14 @@ class EventPlannerApp:
 
     def show_event_selector(self) -> None:
         self.data = None
+        self.clear_workspace()
         self.page.clean()
         cards = []
         for event_data in self.store["events"]:
             event = event_data["event"]
             cards.append(
                 ft.Card(
+                    col={"xs": 12, "sm": 6, "md": 4, "lg": 3},
                     content=ft.Container(
                         ft.Column(
                             [
@@ -209,7 +296,6 @@ class EventPlannerApp:
                             ]
                         ),
                         padding=18,
-                        width=300,
                     )
                 )
             )
@@ -228,20 +314,68 @@ class EventPlannerApp:
                             weight=ft.FontWeight.BOLD,
                         ),
                         ft.Text("Выберите мероприятие для редактирования"),
+                        ft.Text("Мероприятия сохраняются в этом браузере на вашем устройстве."),
+                        ft.Text("После редактирования в другой вкладке обновите эту страницу."),
                         ft.Button(
                             "Добавить мероприятие",
                             icon=ft.Icons.ADD,
                             on_click=lambda _: self.page.go("/events/add"),
                         ),
                         ft.Divider(),
-                        ft.Row(cards, wrap=True) if cards else empty,
+                        ft.Row([
+                            ft.Button("Экспорт JSON", icon=ft.Icons.DOWNLOAD, on_click=self.export_data),
+                            ft.Button("Импорт JSON", icon=ft.Icons.UPLOAD, on_click=self.import_data),
+                        ], wrap=True),
+                        ft.ResponsiveRow(cards) if cards else empty,
                     ],
                     scroll=ft.ScrollMode.AUTO,
                 ),
-                padding=32,
+                padding=16,
                 expand=True,
             )
         )
+
+    def get_backup_picker(self):
+        if self.backup_picker is None:
+            self.backup_picker = ft.FilePicker()
+            self.page.services.append(self.backup_picker)
+        return self.backup_picker
+
+    async def export_data(self, _):
+        try:
+            async with self._action_lock:
+                data = await self.storage.load()
+                self.store = data
+            await self.get_backup_picker().save_file(
+                file_name="event_data.json", src_bytes=encode_data(data).encode("utf-8"),
+            )
+        except Exception as error:
+            self.notice(f"Не удалось экспортировать данные: {error}", True)
+
+    async def import_data(self, _):
+        try:
+            files = await self.get_backup_picker().pick_files(
+                allow_multiple=False, with_data=True, file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["json"],
+            )
+            if not files:
+                return
+            selected = files[0]
+            if selected.size > MAX_DATA_BYTES or selected.bytes is None:
+                raise ValueError("Выберите JSON-файл размером до 2 МБ")
+            imported = decode_data(selected.bytes.decode("utf-8-sig"))
+            async with self._action_lock:
+                self.store = await self.storage.load()
+                # Import as copies, so an archive cannot overwrite existing events.
+                for item in imported["events"]:
+                    item["id"] = uuid4().hex
+                    self.store["events"].append(item)
+                if await self.save_store():
+                    self.page.go("/")
+                    await self.route_change(None)
+                    self.notice(f"Импортировано мероприятий: {len(imported['events'])}")
+        except Exception as error:
+            self.notice(f"Не удалось импортировать данные: {error}", True)
 
     def select_event(self, event) -> None:
         event_id = event.control.data
@@ -249,6 +383,7 @@ class EventPlannerApp:
 
     def show_add_event_page(self) -> None:
         self.data = None
+        self.clear_workspace()
         self.page.clean()
         name = ft.TextField(
             label="Название", autofocus=True, col={"xs": 12, "md": 8}
@@ -263,7 +398,7 @@ class EventPlannerApp:
             label="Описание", multiline=True, min_lines=2, col={"xs": 12}
         )
 
-        def create(_):
+        async def create(_):
             try:
                 if not name.value.strip():
                     raise ValueError("Укажите название мероприятия")
@@ -277,7 +412,8 @@ class EventPlannerApp:
                     "description": description.value.strip(),
                 }
                 self.store["events"].append(event_data)
-                self.storage.save(self.store)
+                if not await self.save_store():
+                    return
                 self.page.go(f"/event/{event_data['id']}")
                 self.notice("Мероприятие добавлено")
             except ValueError as error:
@@ -316,7 +452,7 @@ class EventPlannerApp:
                                 ft.Button(
                                     "Добавить",
                                     icon=ft.Icons.ADD,
-                                    on_click=create,
+                                    on_click=self.action(create),
                                 ),
                             ]
                         ),
@@ -347,13 +483,14 @@ class EventPlannerApp:
             self.notice("Мероприятие уже удалено", True)
             return
 
-        def delete(_):
+        async def delete(_):
             self.store["events"] = [
                 item
                 for item in self.store["events"]
                 if item["id"] != event_id
             ]
-            self.storage.save(self.store)
+            if not await self.save_store():
+                return
             self.page.pop_dialog()
             self.show_event_selector()
             self.notice("Мероприятие удалено")
@@ -375,7 +512,7 @@ class EventPlannerApp:
                         "Удалить",
                         icon=ft.Icons.DELETE,
                         color=ft.Colors.ERROR,
-                        on_click=delete,
+                        on_click=self.action(delete),
                     ),
                 ],
             )
@@ -408,13 +545,14 @@ class EventPlannerApp:
         place = ft.TextField(label="Место проведения", value=item["place"])
         description = ft.TextField(label="Описание", value=item["description"], multiline=True, min_lines=3)
 
-        def save(_):
+        async def save(_):
             try:
                 if not name.value.strip():
                     raise ValueError("Укажите название")
                 datetime.strptime(date.value.strip(), "%d.%m.%Y")
                 self.data["event"] = {"name": name.value.strip(), "date": date.value.strip(), "place": place.value.strip(), "description": description.value.strip()}
-                self.storage.save(self.store)
+                if not await self.save_store():
+                    return
                 self.notice("Мероприятие сохранено")
             except ValueError as error:
                 self.notice("Проверьте название и дату в формате ДД.ММ.ГГГГ" if "time data" in str(error) else str(error), True)
@@ -426,7 +564,7 @@ class EventPlannerApp:
                     spacing=16,
                     run_spacing=20,
                 ),
-                ft.Row([ft.Button("Сохранить", icon=ft.Icons.SAVE, on_click=save)]),
+                ft.Row([ft.Button("Сохранить", icon=ft.Icons.SAVE, on_click=self.action(save))]),
             ],
             width=900,
             spacing=20,
@@ -449,7 +587,7 @@ class EventPlannerApp:
             "Участник добавлен" if role_required else "Гость добавлен"
         )
 
-        def add(_):
+        async def add(_):
             try:
                 if len(name.value.strip().split()) < 2:
                     raise ValueError("Введите имя и фамилию")
@@ -462,7 +600,8 @@ class EventPlannerApp:
                         raise ValueError("Укажите роль")
                     row["role"] = role.value.strip()
                 self.data[target].append(row)
-                self.storage.save(self.store)
+                if not await self.save_store():
+                    return
                 self.page.go(self.event_route(section))
                 self.notice(success_message)
             except ValueError as error:
@@ -487,7 +626,7 @@ class EventPlannerApp:
                                 self.event_route(section)
                             ),
                         ),
-                        ft.Button("Добавить", icon=ft.Icons.ADD, on_click=add),
+                        ft.Button("Добавить", icon=ft.Icons.ADD, on_click=self.action(add)),
                     ]
                 ),
             ],
@@ -509,13 +648,15 @@ class EventPlannerApp:
             cells = [ft.DataCell(ft.Text(person["name"])), ft.DataCell(ft.Text(person["email"]))]
             if role_required:
                 cells.append(ft.DataCell(ft.Text(person["role"])))
-            cells.append(ft.DataCell(ft.IconButton(ft.Icons.DELETE_OUTLINE, data=person["id"], on_click=lambda e, t=target, i=2 if role_required else 1: self.delete_person(t, e.control.data, i))))
+            cells.append(ft.DataCell(ft.IconButton(ft.Icons.DELETE_OUTLINE, data=(target, person["id"], 2 if role_required else 1), on_click=self.action(self.delete_person))))
             rows.append(ft.DataRow(cells=cells))
         return ft.Row([ft.DataTable(columns=columns, rows=rows)], scroll=ft.ScrollMode.AUTO)
 
-    def delete_person(self, target: str, person_id: str, section: int) -> None:
+    async def delete_person(self, event) -> None:
+        target, person_id, section = event.control.data
         self.data[target] = [p for p in self.data[target] if p["id"] != person_id]
-        self.storage.save(self.store)
+        if not await self.save_store():
+            return
         self.show(section)
 
     def people_section(self, target: str, role_required: bool) -> ft.ExpansionTile:
@@ -570,7 +711,7 @@ class EventPlannerApp:
         rows = []
         for key, label in (("income", "Доход"), ("expenses", "Расход")):
             for row in self.data["budget"][key]:
-                rows.append(ft.DataRow(cells=[ft.DataCell(ft.Text(label)), ft.DataCell(ft.Text(row["title"])), ft.DataCell(ft.Text(f"{row['amount']:,.2f} ₽")), ft.DataCell(ft.IconButton(ft.Icons.DELETE_OUTLINE, data=(key, row["id"]), on_click=self.delete_budget))]))
+                rows.append(ft.DataRow(cells=[ft.DataCell(ft.Text(label)), ft.DataCell(ft.Text(row["title"])), ft.DataCell(ft.Text(f"{row['amount']:,.2f} ₽")), ft.DataCell(ft.IconButton(ft.Icons.DELETE_OUTLINE, data=(key, row["id"]), on_click=self.action(self.delete_budget)))]))
         table = ft.DataTable(columns=[ft.DataColumn(ft.Text("Тип")), ft.DataColumn(ft.Text("Статья")), ft.DataColumn(ft.Text("Сумма")), ft.DataColumn(ft.Text(""))], rows=rows) if rows else ft.Text("Статей пока нет", italic=True)
         return self.header("Бюджет", "Автоматический контроль дефицита") + [
             cards,
@@ -603,7 +744,7 @@ class EventPlannerApp:
             ],
         )
 
-        def add(_):
+        async def add(_):
             try:
                 if not title.value.strip():
                     raise ValueError("Введите название статьи")
@@ -614,7 +755,8 @@ class EventPlannerApp:
                         "amount": parse_amount(amount.value),
                     }
                 )
-                self.storage.save(self.store)
+                if not await self.save_store():
+                    return
                 self.page.go(self.event_route("budget"))
                 self.notice("Статья бюджета добавлена")
             except ValueError as error:
@@ -634,7 +776,7 @@ class EventPlannerApp:
                                 self.event_route("budget")
                             ),
                         ),
-                        ft.Button("Добавить", icon=ft.Icons.ADD, on_click=add),
+                        ft.Button("Добавить", icon=ft.Icons.ADD, on_click=self.action(add)),
                     ]
                 ),
             ],
@@ -651,10 +793,11 @@ class EventPlannerApp:
     def metric(label: str, value: float, color, text_color) -> ft.Control:
         return ft.Container(ft.Column([ft.Text(label, color=text_color), ft.Text(f"{value:,.2f} ₽", size=23, weight=ft.FontWeight.BOLD, color=text_color)]), bgcolor=color, padding=18, border_radius=12, width=230)
 
-    def delete_budget(self, event) -> None:
+    async def delete_budget(self, event) -> None:
         key, row_id = event.control.data
         self.data["budget"][key] = [x for x in self.data["budget"][key] if x["id"] != row_id]
-        self.storage.save(self.store)
+        if not await self.save_store():
+            return
         self.show(3)
 
     def mail_view(self) -> list[ft.Control]:
@@ -666,7 +809,7 @@ class EventPlannerApp:
         )
         sender = ft.TextField(label="Email отправителя", value=settings["sender"], col={"xs": 12, "md": 8})
         password = ft.TextField(label="Пароль приложения", value=self.password, password=True, can_reveal_password=True)
-        script = ft.TextField(label="Файл сценария", value=self.script_path, read_only=True, expand=True)
+        script = ft.TextField(label="Файл сценария", value=self.script_attachment.name if self.script_attachment else "", read_only=True)
         if self.mail_picker is None:
             self.mail_picker = ft.FilePicker()
             self.page.services.append(self.mail_picker)
@@ -680,7 +823,7 @@ class EventPlannerApp:
         def preview_person(target):
             return next(iter(self.data[target]), {"name": "Иван Иванов", "email": "ivan@example.com", "role": "Ведущий"})
 
-        def persist():
+        async def persist():
             templates = {target: current_template(target) for target in editors}
             for target, template in templates.items():
                 render_mail(template, preview_person(target), self.data["event"])
@@ -688,13 +831,15 @@ class EventPlannerApp:
                 "sender": sender.value.strip(), "provider": provider.value,
                 "templates": templates,
             }
-            self.storage.save(self.store)
+            if not await self.save_store():
+                return False
             self.password = password.value
+            return True
 
-        def save(_):
+        async def save(_):
             try:
-                persist()
-                self.notice("Настройки и тексты писем сохранены")
+                if await persist():
+                    self.notice("Настройки и тексты писем сохранены")
             except (ValueError, OSError) as error:
                 self.notice(str(error), True)
 
@@ -751,25 +896,69 @@ class EventPlannerApp:
         provider.on_select = provider_changed
 
         async def choose_file(_):
-            files = await self.mail_picker.pick_files(dialog_title="Выберите сценарий", allow_multiple=False)
-            if files:
-                self.script_path = files[0].path
-                script.value = self.script_path
-                self.page.update()
-
-        def send(target: str):
+            event_id = self.data["id"]
             try:
-                people = self.data[target]
-                if not people:
-                    raise ValueError("Список получателей пуст")
-                persist()
-                service = MailService(sender.value, password.value, provider.value)
-                self.script_path = script.value.strip()
-                template = current_template(target)
-                count = service.send_invitations(people, self.data["event"], template) if target == "guests" else service.send_participant_notices(people, self.data["event"], self.script_path, template)
+                files = await self.mail_picker.pick_files(
+                    dialog_title="Выберите сценарий", allow_multiple=False, with_data=True,
+                )
+                if not files or self.data is None or self.data["id"] != event_id:
+                    return
+                selected = files[0]
+                if selected.size > MAX_SCRIPT_BYTES:
+                    raise ValueError("Размер сценария не должен превышать 5 МБ")
+                self.script_attachment = ScriptAttachment(selected.name, selected.bytes)
+                script.value = self.script_attachment.name
+                self.page.update()
+            except Exception as error:
+                self.notice(f"Не удалось выбрать сценарий: {error}", True)
+
+        async def send(target: str):
+            if self.sending:
+                return
+            self.sending = True
+            try:
+                async with self._action_lock:
+                    people = deepcopy(self.data[target])
+                    if not people:
+                        raise ValueError("Список получателей пуст")
+                    attachment = self.script_attachment
+                    if target == "participants" and attachment is None:
+                        raise ValueError("Выберите файл сценария")
+                    event_data = deepcopy(self.data["event"])
+                    template = current_template(target)
+                    credentials = (sender.value, password.value, provider.value)
+                    if not await persist():
+                        return
+
+                def deliver():
+                    if target == "guests":
+                        return MailService(*credentials).send_invitations(people, event_data, template)
+                    return MailService(*credentials).send_participant_notices(people, event_data, attachment, template)
+
+                self.sending = True
+                for button in self.send_buttons:
+                    button.disabled = True
+                self.page.update()
+                count = await asyncio.to_thread(deliver)
                 self.notice(f"Отправлено писем: {count}")
             except Exception as error:
                 self.notice(f"Ошибка рассылки: {error}", True)
+            finally:
+                self.sending = False
+                for button in self.send_buttons:
+                    button.disabled = False
+                self.page.update()
+
+        async def send_guests(_):
+            await send("guests")
+
+        async def send_team(_):
+            await send("participants")
+
+        self.send_buttons = [
+            ft.Button("Пригласить гостей", icon=ft.Icons.SEND, on_click=send_guests, disabled=self.sending),
+            ft.Button("Уведомить команду", icon=ft.Icons.ATTACH_EMAIL, on_click=send_team, disabled=self.sending),
+        ]
 
         return self.header("Рассылка", "Тексты сохраняются отдельно для каждого мероприятия. Пароль приложения не сохраняется на диске.") + [
             ft.ResponsiveRow([sender, provider]), password,
@@ -780,14 +969,12 @@ class EventPlannerApp:
                 expanded_cross_axis_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
             *template_sections,
-            ft.Button("Сохранить настройки и тексты", icon=ft.Icons.SAVE, on_click=save),
+            ft.Button("Сохранить настройки и тексты", icon=ft.Icons.SAVE, on_click=self.action(save)),
             ft.Text("Перед выходом из раздела сохраните изменения. При отправке тексты сохраняются автоматически."),
             ft.Divider(),
             ft.Text("Отправка", size=22, weight=ft.FontWeight.BOLD),
-            ft.Text("Сценарий прикладывается только к письмам команды."),
-            ft.Row([script, ft.Button("Выбрать файл", icon=ft.Icons.FOLDER_OPEN, on_click=choose_file)]),
-            ft.Row([
-                ft.Button("Пригласить гостей", icon=ft.Icons.SEND, on_click=lambda _: send("guests")),
-                ft.Button("Уведомить команду", icon=ft.Icons.ATTACH_EMAIL, on_click=lambda _: send("participants")),
-            ], wrap=True),
+            ft.Text("Сценарий до 5 МБ прикладывается только к письмам команды. После обновления страницы выберите файл заново."),
+            script,
+            ft.Button("Выбрать файл", icon=ft.Icons.FOLDER_OPEN, on_click=choose_file),
+            ft.Row(self.send_buttons, wrap=True),
         ]

@@ -1,7 +1,9 @@
 from pathlib import Path
+from io import IOBase
 from typing import Iterable
 
 import yagmail
+from Backend.attachments import ScriptAttachment
 from Backend.mailing import DEFAULT_TEMPLATES, MAIL_PROVIDERS, render_mail
 from email_validator import (
     EmailSyntaxError,
@@ -69,7 +71,13 @@ class MailService:
     def send_invitations(self, recipients: Iterable[dict], event: dict, template: dict | None = None) -> int:
         return self._send(recipients, event, template if template is not None else DEFAULT_TEMPLATES["guests"])
 
-    def send_participant_notices(self, recipients: Iterable[dict], event: dict, script_path: str, template: dict | None = None) -> int:
+    def send_participant_notices(self, recipients: Iterable[dict], event: dict, script_path: str | ScriptAttachment, template: dict | None = None) -> int:
+        if isinstance(script_path, ScriptAttachment):
+            with script_path.open() as stream:
+                return self._send(
+                    recipients, event, template if template is not None else DEFAULT_TEMPLATES["participants"],
+                    attachments=[stream],
+                )
         script = Path(script_path)
         if not script.is_file():
             raise ValueError("Файл сценария не найден")
@@ -78,7 +86,7 @@ class MailService:
             attachments=[str(script.resolve())],
         )
 
-    def _send(self, recipients: Iterable[dict], event: dict, template: dict, attachments: list[str] | None = None) -> int:
+    def _send(self, recipients: Iterable[dict], event: dict, template: dict, attachments: list[str | IOBase] | None = None) -> int:
         # Validate every message before sending the first one.
         messages = [
             (person["email"], *render_mail(template, person, event))
@@ -87,6 +95,9 @@ class MailService:
         count = 0
         try:
             for email, subject, message in messages:
+                for attachment in attachments or []:
+                    if isinstance(attachment, IOBase):
+                        attachment.seek(0)
                 # A user-entered path or HTML must remain literal message text.
                 self.smtp.send(email, subject, yagmail.raw(message), attachments=attachments)
                 count += 1
