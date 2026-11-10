@@ -40,10 +40,26 @@ class EventPlannerApp:
         self.script_attachment = None
 
     def action(self, handler):
+        # Изменения сохраняются по очереди, даже при быстрых нажатиях.
         async def handle(event):
             async with self._action_lock:
                 await handler(event)
         return handle
+
+    def find_event(self, event_id):
+        for event in self.store["events"]:
+            if event["id"] == event_id:
+                return event
+        return None
+
+    def navigate(self, event):
+        self.page.go(event.control.data)
+
+    def change_section(self, event):
+        self.go_to_section(int(event.control.selected_index))
+
+    def close_dialog(self, _):
+        self.page.pop_dialog()
 
     async def save_store(self) -> bool:
         try:
@@ -55,9 +71,11 @@ class EventPlannerApp:
             self.notice(str(error), True)
         except Exception as error:
             # A failed browser write must not leave unsaved rows in session state.
-            event_id = self.data["id"] if self.data else None
+            event_id = None
+            if self.data:
+                event_id = self.data["id"]
             self.store = self.storage.last_loaded()
-            self.data = next((item for item in self.store["events"] if item["id"] == event_id), None)
+            self.data = self.find_event(event_id)
             self.notice(f"Не удалось сохранить данные в браузере: {error}", True)
         return False
 
@@ -115,27 +133,24 @@ class EventPlannerApp:
                 self.page.go("/")
                 return
             event_id = parts[1]
-            event_data = next(
-                (
-                    item
-                    for item in self.store["events"]
-                    if item["id"] == event_id
-                ),
-                None,
-            )
+            event_data = self.find_event(event_id)
             if event_data is None:
                 self.page.go("/")
                 return
             if self.data is None or self.data["id"] != event_id:
                 self.clear_sensitive()
             self.data = event_data
-            page_name = parts[2] if len(parts) >= 3 else "event"
+            page_name = "event"
+            if len(parts) >= 3:
+                page_name = parts[2]
             sections = {
                 "event": 0,
                 "guests": 1,
                 "team": 2,
                 "budget": 3,
                 "mail": 4,
+                "mail-guests": 5,
+                "mail-team": 6,
             }
             section = sections.get(page_name)
             if section is None or len(parts) > 4:
@@ -149,12 +164,13 @@ class EventPlannerApp:
                 }:
                     self.page.go(f"/event/{event_id}")
                     return
-                add_views = {
-                    "guests": lambda: self.person_add_view("guests", False),
-                    "team": lambda: self.person_add_view("participants", True),
-                    "budget": self.budget_add_view,
-                }
-                self.show_workspace(section, add_views[page_name]())
+                if page_name == "guests":
+                    controls = self.person_add_view("guests", False)
+                elif page_name == "team":
+                    controls = self.person_add_view("participants", True)
+                else:
+                    controls = self.budget_add_view()
+                self.show_workspace(section, controls)
                 return
             self.show_workspace(section)
             return
@@ -170,7 +186,10 @@ class EventPlannerApp:
         self.sidebar.visible = not compact
         self.mobile_header.visible = compact
         self.page.navigation_bar.visible = compact
-        self.workspace_body.padding = 16 if compact else 28
+        if compact:
+            self.workspace_body.padding = 16
+        else:
+            self.workspace_body.padding = 28
         self.page.update()
 
     def clear_workspace(self) -> None:
@@ -182,14 +201,16 @@ class EventPlannerApp:
 
     def event_route(self, section: str = "") -> str:
         base = f"/event/{self.data['id']}"
-        return f"{base}/{section}" if section else base
+        if section:
+            return f"{base}/{section}"
+        return base
 
     def go_to_section(self, index: int) -> None:
-        sections = ("", "guests", "team", "budget", "mail")
+        sections = ("", "guests", "team", "budget", "mail", "mail-guests", "mail-team")
         self.page.go(self.event_route(sections[index]))
 
     def show_workspace(
-        self, selected_index: int = 0, controls: list[ft.Control] | None = None
+        self, selected_index=0, controls=None
     ) -> None:
         rail = ft.NavigationRail(
             bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
@@ -201,8 +222,10 @@ class EventPlannerApp:
                 ft.NavigationRailDestination(icon=ft.Icons.GROUP, label="Команда"),
                 ft.NavigationRailDestination(icon=ft.Icons.ACCOUNT_BALANCE_WALLET, label="Бюджет"),
                 ft.NavigationRailDestination(icon=ft.Icons.MAIL, label="Рассылка"),
+                ft.NavigationRailDestination(icon=ft.Icons.MARK_EMAIL_UNREAD, label="Письмо гостям"),
+                ft.NavigationRailDestination(icon=ft.Icons.ATTACH_EMAIL, label="Письмо команде"),
             ],
-            on_change=lambda e: self.go_to_section(int(e.control.selected_index)),
+            on_change=self.change_section,
         )
         self.sidebar = ft.Container(
             ft.Column(
@@ -210,9 +233,10 @@ class EventPlannerApp:
                     ft.Container(rail, expand=True),
                     ft.Divider(),
                     ft.Button(
-                        "Другие мероприятия",
+                        "Другие\nмероприятия",
                         icon=ft.Icons.SWAP_HORIZ,
-                        on_click=lambda _: self.page.go("/"),
+                        data="/",
+                        on_click=self.navigate,
                     ),
                 ],
                 expand=True,
@@ -222,19 +246,24 @@ class EventPlannerApp:
         )
         self.workspace_body = ft.Container(self.content, expand=True, padding=28)
         self.mobile_header = ft.Row([
-            ft.TextButton("Все мероприятия", icon=ft.Icons.ARROW_BACK,
-                          on_click=lambda _: self.page.go("/")),
+            ft.TextButton(
+                "Все мероприятия", icon=ft.Icons.ARROW_BACK,
+                data="/", on_click=self.navigate,
+            ),
         ])
         self.page.navigation_bar = ft.NavigationBar(
             selected_index=selected_index,
+            label_behavior=ft.NavigationBarLabelBehavior.ONLY_SHOW_SELECTED,
             destinations=[
                 ft.NavigationBarDestination(icon=ft.Icons.EVENT, label="Событие"),
                 ft.NavigationBarDestination(icon=ft.Icons.PERSON_ADD, label="Гости"),
                 ft.NavigationBarDestination(icon=ft.Icons.GROUP, label="Команда"),
                 ft.NavigationBarDestination(icon=ft.Icons.ACCOUNT_BALANCE_WALLET, label="Бюджет"),
                 ft.NavigationBarDestination(icon=ft.Icons.MAIL, label="Рассылка"),
+                ft.NavigationBarDestination(icon=ft.Icons.MARK_EMAIL_UNREAD, label="Письмо гостям"),
+                ft.NavigationBarDestination(icon=ft.Icons.ATTACH_EMAIL, label="Письмо команде"),
             ],
-            on_change=lambda e: self.go_to_section(int(e.control.selected_index)),
+            on_change=self.change_section,
         )
         self.page.clean()
         self.page.add(
@@ -304,6 +333,9 @@ class EventPlannerApp:
             italic=True,
             color=ft.Colors.ON_SURFACE_VARIANT,
         )
+        event_list = empty
+        if cards:
+            event_list = ft.ResponsiveRow(cards)
         self.page.add(
             ft.Container(
                 ft.Column(
@@ -314,19 +346,18 @@ class EventPlannerApp:
                             weight=ft.FontWeight.BOLD,
                         ),
                         ft.Text("Выберите мероприятие для редактирования"),
-                        ft.Text("Мероприятия сохраняются в этом браузере на вашем устройстве."),
-                        ft.Text("После редактирования в другой вкладке обновите эту страницу."),
                         ft.Button(
                             "Добавить мероприятие",
                             icon=ft.Icons.ADD,
-                            on_click=lambda _: self.page.go("/events/add"),
+                            data="/events/add",
+                            on_click=self.navigate,
                         ),
                         ft.Divider(),
                         ft.Row([
                             ft.Button("Экспорт JSON", icon=ft.Icons.DOWNLOAD, on_click=self.export_data),
                             ft.Button("Импорт JSON", icon=ft.Icons.UPLOAD, on_click=self.import_data),
                         ], wrap=True),
-                        ft.ResponsiveRow(cards) if cards else empty,
+                        event_list,
                     ],
                     scroll=ft.ScrollMode.AUTO,
                 ),
@@ -417,11 +448,9 @@ class EventPlannerApp:
                 self.page.go(f"/event/{event_data['id']}")
                 self.notice("Мероприятие добавлено")
             except ValueError as error:
-                message = (
-                    "Дата должна быть в формате ДД.ММ.ГГГГ"
-                    if "time data" in str(error)
-                    else str(error)
-                )
+                message = str(error)
+                if "time data" in message:
+                    message = "Дата должна быть в формате ДД.ММ.ГГГГ"
                 self.notice(message, True)
 
         self.page.add(
@@ -447,7 +476,8 @@ class EventPlannerApp:
                                 ft.Button(
                                     "Назад",
                                     icon=ft.Icons.ARROW_BACK,
-                                    on_click=lambda _: self.page.go("/"),
+                                    data="/",
+                                    on_click=self.navigate,
                                 ),
                                 ft.Button(
                                     "Добавить",
@@ -471,24 +501,17 @@ class EventPlannerApp:
 
     def open_delete_dialog(self, event) -> None:
         event_id = event.control.data
-        event_data = next(
-            (
-                item
-                for item in self.store["events"]
-                if item["id"] == event_id
-            ),
-            None,
-        )
+        event_data = self.find_event(event_id)
         if event_data is None:
             self.notice("Мероприятие уже удалено", True)
             return
 
         async def delete(_):
-            self.store["events"] = [
-                item
-                for item in self.store["events"]
-                if item["id"] != event_id
-            ]
+            remaining_events = []
+            for item in self.store["events"]:
+                if item["id"] != event_id:
+                    remaining_events.append(item)
+            self.store["events"] = remaining_events
             if not await self.save_store():
                 return
             self.page.pop_dialog()
@@ -506,7 +529,7 @@ class EventPlannerApp:
                 ),
                 actions=[
                     ft.Button(
-                        "Отмена", on_click=lambda _: self.page.pop_dialog()
+                        "Отмена", on_click=self.close_dialog
                     ),
                     ft.Button(
                         "Удалить",
@@ -519,26 +542,36 @@ class EventPlannerApp:
         )
 
     def show(self, index: int) -> None:
-        views = (self.event_view, self.guests_view, self.team_view, self.budget_view, self.mail_view)
+        views = (
+            self.event_view, self.guests_view, self.team_view, self.budget_view,
+            self.mail_view, self.guests_mail_view, self.team_mail_view,
+        )
         self.content.controls = views[index]()
         self.page.update()
 
     def notice(self, message: str, error: bool = False) -> None:
+        text_color = ft.Colors.ON_TERTIARY_CONTAINER
+        background_color = ft.Colors.TERTIARY_CONTAINER
+        if error:
+            text_color = ft.Colors.ON_ERROR_CONTAINER
+            background_color = ft.Colors.ERROR_CONTAINER
+
         self.page.show_dialog(
             ft.SnackBar(
-                ft.Text(
-                    message,
-                    color=ft.Colors.ON_ERROR_CONTAINER if error else ft.Colors.ON_TERTIARY_CONTAINER,
-                ),
-                bgcolor=ft.Colors.ERROR_CONTAINER if error else ft.Colors.TERTIARY_CONTAINER,
+                ft.Text(message, color=text_color),
+                bgcolor=background_color,
             )
         )
 
     @staticmethod
-    def header(title: str, subtitle: str) -> list[ft.Control]:
-        return [ft.Text(title, size=30, weight=ft.FontWeight.BOLD), ft.Text(subtitle, color=ft.Colors.ON_SURFACE_VARIANT), ft.Divider()]
+    def header(title: str, subtitle: str):
+        return [
+            ft.Text(title, size=30, weight=ft.FontWeight.BOLD),
+            ft.Text(subtitle, color=ft.Colors.ON_SURFACE_VARIANT),
+            ft.Divider(),
+        ]
 
-    def event_view(self) -> list[ft.Control]:
+    def event_view(self):
         item = self.data["event"]
         name = ft.TextField(label="Название", value=item["name"], col={"xs": 12, "md": 8})
         date = ft.TextField(label="Дата (ДД.ММ.ГГГГ)", value=item["date"], col={"xs": 12, "md": 4})
@@ -550,12 +583,20 @@ class EventPlannerApp:
                 if not name.value.strip():
                     raise ValueError("Укажите название")
                 datetime.strptime(date.value.strip(), "%d.%m.%Y")
-                self.data["event"] = {"name": name.value.strip(), "date": date.value.strip(), "place": place.value.strip(), "description": description.value.strip()}
+                self.data["event"] = {
+                    "name": name.value.strip(),
+                    "date": date.value.strip(),
+                    "place": place.value.strip(),
+                    "description": description.value.strip(),
+                }
                 if not await self.save_store():
                     return
                 self.notice("Мероприятие сохранено")
             except ValueError as error:
-                self.notice("Проверьте название и дату в формате ДД.ММ.ГГГГ" if "time data" in str(error) else str(error), True)
+                message = str(error)
+                if "time data" in message:
+                    message = "Проверьте название и дату в формате ДД.ММ.ГГГГ"
+                self.notice(message, True)
 
         form = ft.Column(
             [
@@ -572,28 +613,31 @@ class EventPlannerApp:
         )
         return self.header("Мероприятие", "Основная информация для писем") + [form]
 
-    def person_add_view(
-        self, target: str, role_required: bool
-    ) -> list[ft.Control]:
+    def person_add_view(self, target: str, role_required: bool):
         name = ft.TextField(label="ФИО", autofocus=True, col={"xs": 12, "md": 6})
         email = ft.TextField(label="Email", col={"xs": 12, "md": 6})
-        role = (
-            ft.TextField(label="Роль", col={"xs": 12, "md": 6})
-            if role_required
-            else None
-        )
-        section = "team" if role_required else "guests"
-        success_message = (
-            "Участник добавлен" if role_required else "Гость добавлен"
-        )
+        role = None
+        section = "guests"
+        title = "Добавить гостя"
+        subtitle = "Укажите имя и email получателя приглашения"
+        success_message = "Гость добавлен"
+        controls = [name, email]
+        if role_required:
+            role = ft.TextField(label="Роль", col={"xs": 12, "md": 6})
+            controls.append(role)
+            section = "team"
+            title = "Добавить участника"
+            subtitle = "Укажите контакты и роль в команде"
+            success_message = "Участник добавлен"
 
         async def add(_):
             try:
                 if len(name.value.strip().split()) < 2:
                     raise ValueError("Введите имя и фамилию")
                 address = normalize_email(email.value)
-                if any(x["email"].lower() == address.lower() for x in self.data[target]):
-                    raise ValueError("Этот email уже добавлен")
+                for person in self.data[target]:
+                    if person["email"].lower() == address.lower():
+                        raise ValueError("Этот email уже добавлен")
                 row = {"id": uuid4().hex, "name": name.value.strip(), "email": address}
                 if role_required:
                     if not role.value.strip():
@@ -607,13 +651,6 @@ class EventPlannerApp:
             except ValueError as error:
                 self.notice(str(error), True)
 
-        controls = [name, email] + ([role] if role else [])
-        title = "Добавить участника" if role_required else "Добавить гостя"
-        subtitle = (
-            "Укажите контакты и роль в команде"
-            if role_required
-            else "Укажите имя и email получателя приглашения"
-        )
         form = ft.Column(
             [
                 ft.ResponsiveRow(controls, spacing=16, run_spacing=20),
@@ -622,9 +659,8 @@ class EventPlannerApp:
                         ft.Button(
                             "Назад",
                             icon=ft.Icons.ARROW_BACK,
-                            on_click=lambda _: self.page.go(
-                                self.event_route(section)
-                            ),
+                            data=self.event_route(section),
+                            on_click=self.navigate,
                         ),
                         ft.Button("Добавить", icon=ft.Icons.ADD, on_click=self.action(add)),
                     ]
@@ -640,27 +676,40 @@ class EventPlannerApp:
         if not self.data[target]:
             return ft.Text("Список пока пуст", italic=True, color=ft.Colors.ON_SURFACE_VARIANT)
         columns = [ft.DataColumn(ft.Text("ФИО")), ft.DataColumn(ft.Text("Email"))]
+        section = 1
         if role_required:
             columns.append(ft.DataColumn(ft.Text("Роль")))
+            section = 2
         columns.append(ft.DataColumn(ft.Text("")))
         rows = []
         for person in self.data[target]:
             cells = [ft.DataCell(ft.Text(person["name"])), ft.DataCell(ft.Text(person["email"]))]
             if role_required:
                 cells.append(ft.DataCell(ft.Text(person["role"])))
-            cells.append(ft.DataCell(ft.IconButton(ft.Icons.DELETE_OUTLINE, data=(target, person["id"], 2 if role_required else 1), on_click=self.action(self.delete_person))))
+            delete_button = ft.IconButton(
+                ft.Icons.DELETE_OUTLINE,
+                data=(target, person["id"], section),
+                on_click=self.action(self.delete_person),
+            )
+            cells.append(ft.DataCell(delete_button))
             rows.append(ft.DataRow(cells=cells))
         return ft.Row([ft.DataTable(columns=columns, rows=rows)], scroll=ft.ScrollMode.AUTO)
 
     async def delete_person(self, event) -> None:
         target, person_id, section = event.control.data
-        self.data[target] = [p for p in self.data[target] if p["id"] != person_id]
+        remaining_people = []
+        for person in self.data[target]:
+            if person["id"] != person_id:
+                remaining_people.append(person)
+        self.data[target] = remaining_people
         if not await self.save_store():
             return
         self.show(section)
 
     def people_section(self, target: str, role_required: bool) -> ft.ExpansionTile:
-        title = "Список участников" if role_required else "Список гостей"
+        title = "Список гостей"
+        if role_required:
+            title = "Список участников"
         return ft.ExpansionTile(
             title=ft.Text(f"{title} ({len(self.data[target])})"),
             leading=ft.Icons.GROUP,
@@ -671,39 +720,44 @@ class EventPlannerApp:
             maintain_state=True,
         )
 
-    def guests_view(self) -> list[ft.Control]:
+    def guests_view(self):
         return self.header("Гости", "Получатели приглашений") + [
             ft.Button(
                 "Добавить гостя",
                 icon=ft.Icons.PERSON_ADD,
-                on_click=lambda _: self.page.go(
-                    self.event_route("guests/add")
-                ),
+                data=self.event_route("guests/add"),
+                on_click=self.navigate,
             ),
             self.people_section("guests", False),
         ]
 
-    def team_view(self) -> list[ft.Control]:
+    def team_view(self):
         return self.header("Команда", "Участники и распределённые роли") + [
             ft.Button(
                 "Добавить участника",
                 icon=ft.Icons.PERSON_ADD,
-                on_click=lambda _: self.page.go(self.event_route("team/add")),
+                data=self.event_route("team/add"),
+                on_click=self.navigate,
             ),
             self.people_section("participants", True),
         ]
 
-    def budget_view(self) -> list[ft.Control]:
+    def budget_view(self):
         income, expenses, balance = budget_totals(self.data["budget"])
+        balance_label = "Остаток"
+        balance_color = ft.Colors.TERTIARY_CONTAINER
+        balance_text_color = ft.Colors.ON_TERTIARY_CONTAINER
+        if balance < 0:
+            balance_label = "Дефицит"
+            balance_color = ft.Colors.ERROR_CONTAINER
+            balance_text_color = ft.Colors.ON_ERROR_CONTAINER
+
         cards = ft.Row(
             [
                 self.metric("Доходы", income, ft.Colors.TERTIARY_CONTAINER, ft.Colors.ON_TERTIARY_CONTAINER),
                 self.metric("Расходы", expenses, ft.Colors.ERROR_CONTAINER, ft.Colors.ON_ERROR_CONTAINER),
                 self.metric(
-                    "Дефицит" if balance < 0 else "Остаток",
-                    abs(balance),
-                    ft.Colors.ERROR_CONTAINER if balance < 0 else ft.Colors.TERTIARY_CONTAINER,
-                    ft.Colors.ON_ERROR_CONTAINER if balance < 0 else ft.Colors.ON_TERTIARY_CONTAINER,
+                    balance_label, abs(balance), balance_color, balance_text_color,
                 ),
             ],
             wrap=True,
@@ -711,21 +765,40 @@ class EventPlannerApp:
         rows = []
         for key, label in (("income", "Доход"), ("expenses", "Расход")):
             for row in self.data["budget"][key]:
-                rows.append(ft.DataRow(cells=[ft.DataCell(ft.Text(label)), ft.DataCell(ft.Text(row["title"])), ft.DataCell(ft.Text(f"{row['amount']:,.2f} ₽")), ft.DataCell(ft.IconButton(ft.Icons.DELETE_OUTLINE, data=(key, row["id"]), on_click=self.action(self.delete_budget)))]))
-        table = ft.DataTable(columns=[ft.DataColumn(ft.Text("Тип")), ft.DataColumn(ft.Text("Статья")), ft.DataColumn(ft.Text("Сумма")), ft.DataColumn(ft.Text(""))], rows=rows) if rows else ft.Text("Статей пока нет", italic=True)
+                delete_button = ft.IconButton(
+                    ft.Icons.DELETE_OUTLINE,
+                    data=(key, row["id"]),
+                    on_click=self.action(self.delete_budget),
+                )
+                cells = [
+                    ft.DataCell(ft.Text(label)),
+                    ft.DataCell(ft.Text(row["title"])),
+                    ft.DataCell(ft.Text(f"{row['amount']:,.2f} ₽")),
+                    ft.DataCell(delete_button),
+                ]
+                rows.append(ft.DataRow(cells=cells))
+
+        table = ft.Text("Статей пока нет", italic=True)
+        if rows:
+            columns = [
+                ft.DataColumn(ft.Text("Тип")),
+                ft.DataColumn(ft.Text("Статья")),
+                ft.DataColumn(ft.Text("Сумма")),
+                ft.DataColumn(ft.Text("")),
+            ]
+            table = ft.DataTable(columns=columns, rows=rows)
         return self.header("Бюджет", "Автоматический контроль дефицита") + [
             cards,
             ft.Button(
                 "Добавить статью",
                 icon=ft.Icons.ADD,
-                on_click=lambda _: self.page.go(
-                    self.event_route("budget/add")
-                ),
+                data=self.event_route("budget/add"),
+                on_click=self.navigate,
             ),
             ft.Row([table], scroll=ft.ScrollMode.AUTO),
         ]
 
-    def budget_add_view(self) -> list[ft.Control]:
+    def budget_add_view(self):
         title = ft.TextField(
             label="Статья", autofocus=True, col={"xs": 12, "md": 6}
         )
@@ -772,9 +845,8 @@ class EventPlannerApp:
                         ft.Button(
                             "Назад",
                             icon=ft.Icons.ARROW_BACK,
-                            on_click=lambda _: self.page.go(
-                                self.event_route("budget")
-                            ),
+                            data=self.event_route("budget"),
+                            on_click=self.navigate,
                         ),
                         ft.Button("Добавить", icon=ft.Icons.ADD, on_click=self.action(add)),
                     ]
@@ -791,46 +863,139 @@ class EventPlannerApp:
 
     @staticmethod
     def metric(label: str, value: float, color, text_color) -> ft.Control:
-        return ft.Container(ft.Column([ft.Text(label, color=text_color), ft.Text(f"{value:,.2f} ₽", size=23, weight=ft.FontWeight.BOLD, color=text_color)]), bgcolor=color, padding=18, border_radius=12, width=230)
+        content = ft.Column([
+            ft.Text(label, color=text_color),
+            ft.Text(
+                f"{value:,.2f} ₽", size=23,
+                weight=ft.FontWeight.BOLD, color=text_color,
+            ),
+        ])
+        return ft.Container(
+            content, bgcolor=color, padding=18, border_radius=12, width=230,
+        )
 
     async def delete_budget(self, event) -> None:
         key, row_id = event.control.data
-        self.data["budget"][key] = [x for x in self.data["budget"][key] if x["id"] != row_id]
+        remaining_rows = []
+        for row in self.data["budget"][key]:
+            if row["id"] != row_id:
+                remaining_rows.append(row)
+        self.data["budget"][key] = remaining_rows
         if not await self.save_store():
             return
         self.show(3)
 
-    def mail_view(self) -> list[ft.Control]:
+    def guests_mail_view(self):
+        return self.mail_template_view("guests", "Письмо гостям")
+
+    def team_mail_view(self):
+        return self.mail_template_view("participants", "Письмо команде")
+
+    def preview_person(self, target):
+        people = self.data[target]
+        if people:
+            return people[0]
+        return {
+            "name": "Иван Иванов",
+            "email": "ivan@example.com",
+            "role": "Ведущий",
+        }
+
+    def mail_template_view(self, target, title):
+        template = mail_settings(self.data["mail"])["templates"][target]
+        subject = ft.TextField(label="Тема письма", value=template["subject"])
+        body = ft.TextField(
+            label="Текст письма", value=template["body"],
+            multiline=True, min_lines=6, max_lines=16,
+        )
+
+        def current_template():
+            return {"subject": subject.value, "body": body.value}
+
+        async def save(_):
+            try:
+                template = current_template()
+                render_mail(template, self.preview_person(target), self.data["event"])
+                settings = mail_settings(self.data["mail"])
+                settings["templates"][target] = template
+                self.data["mail"] = settings
+                if await self.save_store():
+                    self.notice("Текст письма сохранён")
+            except (ValueError, OSError) as error:
+                self.notice(str(error), True)
+
+        def preview(_):
+            try:
+                template = current_template()
+                person = self.preview_person(target)
+                subject, body = render_mail(template, person, self.data["event"])
+                attachment_text = "Без вложений"
+                if target == "participants":
+                    script_name = "файл не выбран"
+                    if self.script_attachment:
+                        script_name = self.script_attachment.name
+                    attachment_text = "Вложение: " + script_name
+                content = ft.Column([
+                    ft.Text("Данные первого получателя; если список пуст — пример."),
+                    ft.Text(f"Тема: {subject}", weight=ft.FontWeight.BOLD, selectable=True),
+                    ft.Text(body, selectable=True),
+                    ft.Text(attachment_text),
+                ], width=650, tight=True, scroll=ft.ScrollMode.AUTO)
+                dialog = ft.AlertDialog(
+                    title=ft.Text("Предпросмотр письма"),
+                    content=content,
+                    actions=[ft.Button("Закрыть", on_click=self.close_dialog)],
+                )
+                self.page.show_dialog(dialog)
+            except ValueError as error:
+                self.notice(str(error), True)
+
+        def reset(_):
+            subject.value = DEFAULT_TEMPLATES[target]["subject"]
+            body.value = DEFAULT_TEMPLATES[target]["body"]
+            self.page.update()
+
+        return self.header(title, "Отредактируйте тему и текст письма для этого мероприятия.") + [
+            subject, body,
+            ft.Text(
+                "Подстановки: {name} — ФИО, {email} — email, "
+                "{event_name} — мероприятие, {date} — дата, {place} — место, "
+                "{description} — описание, {role} — роль в команде. "
+                "Для обычных фигурных скобок используйте {{ и }}."
+            ),
+            ft.Row([
+                ft.Button("Предпросмотр", icon=ft.Icons.VISIBILITY, on_click=preview),
+                ft.Button("Стандартный текст", on_click=reset),
+                ft.Button("Сохранить письмо", icon=ft.Icons.SAVE, on_click=self.action(save)),
+            ], wrap=True),
+            ft.Text("Перед выходом из раздела сохраните изменения. Отправка писем доступна в разделе «Рассылка»."),
+        ]
+
+    def mail_view(self):
         settings = mail_settings(self.data["mail"])
+        provider_options = []
+        for key, item in MAIL_PROVIDERS.items():
+            provider_options.append(ft.DropdownOption(key=key, text=item["name"]))
         provider = ft.Dropdown(
             label="Почтовый сервис", value=settings["provider"],
-            options=[ft.DropdownOption(key=key, text=item["name"]) for key, item in MAIL_PROVIDERS.items()],
+            options=provider_options,
             col={"xs": 12, "md": 4},
         )
         sender = ft.TextField(label="Email отправителя", value=settings["sender"], col={"xs": 12, "md": 8})
         password = ft.TextField(label="Пароль приложения", value=self.password, password=True, can_reveal_password=True)
-        script = ft.TextField(label="Файл сценария", value=self.script_attachment.name if self.script_attachment else "", read_only=True)
+        script_name = ""
+        if self.script_attachment:
+            script_name = self.script_attachment.name
+        script = ft.TextField(label="Файл сценария", value=script_name, read_only=True)
         if self.mail_picker is None:
             self.mail_picker = ft.FilePicker()
             self.page.services.append(self.mail_picker)
 
-        editors = {}
-
-        def current_template(target):
-            subject, body = editors[target]
-            return {"subject": subject.value, "body": body.value}
-
-        def preview_person(target):
-            return next(iter(self.data[target]), {"name": "Иван Иванов", "email": "ivan@example.com", "role": "Ведущий"})
-
         async def persist():
-            templates = {target: current_template(target) for target in editors}
-            for target, template in templates.items():
-                render_mail(template, preview_person(target), self.data["event"])
-            self.data["mail"] = {
-                "sender": sender.value.strip(), "provider": provider.value,
-                "templates": templates,
-            }
+            settings = mail_settings(self.data["mail"])
+            settings["sender"] = sender.value.strip()
+            settings["provider"] = provider.value
+            self.data["mail"] = settings
             if not await self.save_store():
                 return False
             self.password = password.value
@@ -839,51 +1004,9 @@ class EventPlannerApp:
         async def save(_):
             try:
                 if await persist():
-                    self.notice("Настройки и тексты писем сохранены")
+                    self.notice("Настройки почты сохранены")
             except (ValueError, OSError) as error:
                 self.notice(str(error), True)
-
-        def preview(target):
-            try:
-                subject, body = render_mail(current_template(target), preview_person(target), self.data["event"])
-                self.page.show_dialog(ft.AlertDialog(
-                    title=ft.Text("Предпросмотр письма"),
-                    content=ft.Column([
-                        ft.Text("Данные первого получателя; если список пуст — пример."),
-                        ft.Text(f"Тема: {subject}", weight=ft.FontWeight.BOLD, selectable=True),
-                        ft.Text(body, selectable=True),
-                        ft.Text("Вложение: " + (script.value or "файл не выбран")) if target == "participants" else ft.Text("Без вложений"),
-                    ], width=650, tight=True, scroll=ft.ScrollMode.AUTO),
-                    actions=[ft.Button("Закрыть", on_click=lambda _: self.page.pop_dialog())],
-                ))
-            except ValueError as error:
-                self.notice(str(error), True)
-
-        def reset(target):
-            subject, body = editors[target]
-            subject.value = DEFAULT_TEMPLATES[target]["subject"]
-            body.value = DEFAULT_TEMPLATES[target]["body"]
-            self.page.update()
-
-        template_sections = []
-        for target, title in (("guests", "Письмо гостям"), ("participants", "Письмо команде")):
-            template = settings["templates"][target]
-            subject = ft.TextField(label="Тема письма", value=template["subject"])
-            body = ft.TextField(label="Текст письма", value=template["body"], multiline=True, min_lines=6, max_lines=16)
-            editors[target] = (subject, body)
-            template_sections.append(ft.ExpansionTile(
-                title=ft.Text(title), leading=ft.Icons.EDIT,
-                expanded=False, maintain_state=True, controls_padding=16,
-                expanded_cross_axis_alignment=ft.CrossAxisAlignment.STRETCH,
-                controls=[ft.Column([
-                    subject, body,
-                    ft.Text("Подстановки: {name} — ФИО, {email} — email, {event_name} — мероприятие, {date} — дата, {place} — место, {description} — описание, {role} — роль в команде. Для обычных фигурных скобок используйте {{ и }}."),
-                    ft.Row([
-                        ft.Button("Предпросмотр", icon=ft.Icons.VISIBILITY, on_click=lambda _, t=target: preview(t)),
-                        ft.Button("Стандартный текст", on_click=lambda _, t=target: reset(t)),
-                    ], wrap=True),
-                ], spacing=12)],
-            ))
 
         help_text = ft.Markdown(MAIL_HELP[provider.value], selectable=True, auto_follow_links=True)
 
@@ -925,17 +1048,19 @@ class EventPlannerApp:
                     if target == "participants" and attachment is None:
                         raise ValueError("Выберите файл сценария")
                     event_data = deepcopy(self.data["event"])
-                    template = current_template(target)
-                    credentials = (sender.value, password.value, provider.value)
+                    template = mail_settings(self.data["mail"])["templates"][target]
+                    sender_email = sender.value
+                    app_password = password.value
+                    mail_provider = provider.value
                     if not await persist():
                         return
 
                 def deliver():
+                    service = MailService(sender_email, app_password, mail_provider)
                     if target == "guests":
-                        return MailService(*credentials).send_invitations(people, event_data, template)
-                    return MailService(*credentials).send_participant_notices(people, event_data, attachment, template)
+                        return service.send_invitations(people, event_data, template)
+                    return service.send_participant_notices(people, event_data, attachment, template)
 
-                self.sending = True
                 for button in self.send_buttons:
                     button.disabled = True
                 self.page.update()
@@ -960,7 +1085,11 @@ class EventPlannerApp:
             ft.Button("Уведомить команду", icon=ft.Icons.ATTACH_EMAIL, on_click=send_team, disabled=self.sending),
         ]
 
-        return self.header("Рассылка", "Тексты сохраняются отдельно для каждого мероприятия. Пароль приложения не сохраняется на диске.") + [
+        controls = self.header(
+            "Рассылка",
+            "Настройте почту и отправьте письма. Пароль приложения хранится только в текущем сеансе.",
+        )
+        controls.extend([
             ft.ResponsiveRow([sender, provider]), password,
             ft.ExpansionTile(
                 title=ft.Text("Инструкция для выбранного почтового сервиса"),
@@ -968,13 +1097,18 @@ class EventPlannerApp:
                 controls=[help_text], controls_padding=16,
                 expanded_cross_axis_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
-            *template_sections,
-            ft.Button("Сохранить настройки и тексты", icon=ft.Icons.SAVE, on_click=self.action(save)),
-            ft.Text("Перед выходом из раздела сохраните изменения. При отправке тексты сохраняются автоматически."),
+        ])
+        controls.extend([
+            ft.Button("Сохранить настройки", icon=ft.Icons.SAVE, on_click=self.action(save)),
+            ft.Text("Тема и текст редактируются в разделах «Письмо гостям» и «Письмо команде». При отправке используются сохранённые письма."),
             ft.Divider(),
             ft.Text("Отправка", size=22, weight=ft.FontWeight.BOLD),
-            ft.Text("Сценарий до 5 МБ прикладывается только к письмам команды. После обновления страницы выберите файл заново."),
+            ft.Text(
+                "Сценарий до 5 МБ прикладывается только к письмам команды. "
+                "После обновления страницы выберите файл заново."
+            ),
             script,
             ft.Button("Выбрать файл", icon=ft.Icons.FOLDER_OPEN, on_click=choose_file),
             ft.Row(self.send_buttons, wrap=True),
-        ]
+        ])
+        return controls

@@ -1,6 +1,5 @@
 from pathlib import Path
 from io import IOBase
-from typing import Iterable
 
 import yagmail
 from Backend.attachments import ScriptAttachment
@@ -28,7 +27,7 @@ def normalize_email(value: str) -> str:
         ) from error
 
 
-def validate_recipients(recipients: Iterable[dict]) -> list[dict]:
+def validate_recipients(recipients):
     validated = []
     for person in recipients:
         try:
@@ -36,7 +35,9 @@ def validate_recipients(recipients: Iterable[dict]) -> list[dict]:
         except ValueError as error:
             name = person.get("name") or "без имени"
             raise ValueError(f"Проверьте email для «{name}»: {error}") from error
-        validated.append({**person, "email": email})
+        recipient = person.copy()
+        recipient["email"] = email
+        validated.append(recipient)
     return validated
 
 
@@ -50,9 +51,17 @@ def parse_amount(value: str) -> float:
     return round(amount, 2)
 
 
-def budget_totals(budget: dict) -> tuple[float, float, float]:
-    income = sum(float(row["amount"]) for row in budget.get("income", []))
-    expenses = sum(float(row["amount"]) for row in budget.get("expenses", []))
+def budget_totals(budget: dict):
+    income_amounts = []
+    for row in budget.get("income", []):
+        income_amounts.append(float(row["amount"]))
+
+    expense_amounts = []
+    for row in budget.get("expenses", []):
+        expense_amounts.append(float(row["amount"]))
+
+    income = sum(income_amounts)
+    expenses = sum(expense_amounts)
     return income, expenses, income - expenses
 
 
@@ -68,36 +77,40 @@ class MailService:
             port=465, smtp_ssl=True, smtp_starttls=False, timeout=30,
         )
 
-    def send_invitations(self, recipients: Iterable[dict], event: dict, template: dict | None = None) -> int:
-        return self._send(recipients, event, template if template is not None else DEFAULT_TEMPLATES["guests"])
+    def send_invitations(self, recipients, event, template=None):
+        if template is None:
+            template = DEFAULT_TEMPLATES["guests"]
+        return self._send(recipients, event, template)
 
-    def send_participant_notices(self, recipients: Iterable[dict], event: dict, script_path: str | ScriptAttachment, template: dict | None = None) -> int:
+    def send_participant_notices(self, recipients, event, script_path, template=None):
+        if template is None:
+            template = DEFAULT_TEMPLATES["participants"]
         if isinstance(script_path, ScriptAttachment):
             with script_path.open() as stream:
                 return self._send(
-                    recipients, event, template if template is not None else DEFAULT_TEMPLATES["participants"],
-                    attachments=[stream],
+                    recipients, event, template, attachments=[stream],
                 )
         script = Path(script_path)
         if not script.is_file():
             raise ValueError("Файл сценария не найден")
         return self._send(
-            recipients, event, template if template is not None else DEFAULT_TEMPLATES["participants"],
-            attachments=[str(script.resolve())],
+            recipients, event, template, attachments=[str(script.resolve())],
         )
 
-    def _send(self, recipients: Iterable[dict], event: dict, template: dict, attachments: list[str | IOBase] | None = None) -> int:
+    def _send(self, recipients, event, template, attachments=None):
         # Validate every message before sending the first one.
-        messages = [
-            (person["email"], *render_mail(template, person, event))
-            for person in validate_recipients(recipients)
-        ]
+        messages = []
+        for person in validate_recipients(recipients):
+            subject, body = render_mail(template, person, event)
+            messages.append((person["email"], subject, body))
+
         count = 0
         try:
             for email, subject, message in messages:
-                for attachment in attachments or []:
-                    if isinstance(attachment, IOBase):
-                        attachment.seek(0)
+                if attachments:
+                    for attachment in attachments:
+                        if isinstance(attachment, IOBase):
+                            attachment.seek(0)
                 # A user-entered path or HTML must remain literal message text.
                 self.smtp.send(email, subject, yagmail.raw(message), attachments=attachments)
                 count += 1

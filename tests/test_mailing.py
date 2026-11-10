@@ -146,30 +146,82 @@ class MailUiTests(unittest.IsolatedAsyncioTestCase):
         self.controls = self.app.mail_view()
         self.tiles = [c for c in self.controls if isinstance(c, ft.ExpansionTile)]
 
-    async def test_edit_save_reload_preview_and_provider_help(self):
+    async def test_provider_help_and_settings_save_preserve_templates(self):
         provider = self.controls[3].controls[1]
         password = self.controls[4]
+        self.app.data["mail"]["templates"]["guests"]["body"] = "Сохранённое приглашение"
+        templates = deepcopy(self.app.data["mail"]["templates"])
         provider.value = "yandex"
         password.value = "old secret"
         provider.on_select(None)
         self.assertEqual(password.value, "")
         self.assertEqual(self.tiles[0].controls[0].value, MAIL_HELP["yandex"])
-        fields = self.tiles[1].controls[0].controls
-        fields[0].value = "Новая тема"
-        fields[1].value = "Добрый день, {name}!"
-        fields[3].controls[0].on_click(None)
-        self.assertIn("Иван Иванов", self.page.show_dialog.call_args.args[0].content.controls[2].value)
-        save_button = next(c for c in self.controls if isinstance(c, ft.Button) and c.content == "Сохранить настройки и тексты")
+        self.assertEqual(len(self.tiles), 1)
+        save_button = next(c for c in self.controls if isinstance(c, ft.Button) and c.content == "Сохранить настройки")
         password.value = "never-save-this"
         await save_button.on_click(None)
         self.app.storage.save.assert_awaited_once_with(self.app.store)
-        self.assertEqual(self.app.data["mail"]["templates"]["guests"]["body"], "Добрый день, {name}!")
+        self.assertEqual(self.app.data["mail"]["templates"], templates)
         self.assertNotIn("never-save-this", json.dumps(self.app.store))
         self.assertEqual(self.app.data["mail"]["provider"], "yandex")
-        controls = self.app.mail_view()
-        tiles = [c for c in controls if isinstance(c, ft.ExpansionTile)]
-        self.assertEqual(tiles[1].controls[0].controls[0].value, "Новая тема")
+        self.app.mail_view()
         self.assertEqual(len(self.page.services), 2)
+
+    async def test_each_letter_saves_independently_and_reloads(self):
+        self.app.data["mail"]["sender"] = "sender@example.com"
+        self.app.data["mail"]["provider"] = "yandex"
+        for target, view in (("guests", self.app.guests_mail_view), ("participants", self.app.team_mail_view)):
+            with self.subTest(target=target):
+                before = deepcopy(self.app.data["mail"])
+                controls = view()
+                controls[3].value = "Новая тема: {name}"
+                controls[4].value = "Добрый день, {name}!"
+                controls[6].controls[0].on_click(None)
+                self.assertIn("Иван Иванов", self.page.show_dialog.call_args.args[0].content.controls[2].value)
+                await controls[6].controls[2].on_click(None)
+                expected = deepcopy(before)
+                expected["templates"][target] = {"subject": "Новая тема: {name}", "body": "Добрый день, {name}!"}
+                self.assertEqual(self.app.data["mail"], expected)
+                self.assertEqual(view()[3].value, "Новая тема: {name}")
+                self.assertEqual(view()[4].value, "Добрый день, {name}!")
+        self.assertEqual(self.app.storage.save.await_count, 2)
+
+    async def test_invalid_letter_does_not_overwrite_saved_text(self):
+        before = deepcopy(self.app.data["mail"])
+        controls = self.app.guests_mail_view()
+        controls[4].value = "{unknown}"
+        await controls[6].controls[2].on_click(None)
+        self.app.storage.save.assert_not_awaited()
+        self.assertEqual(self.app.data["mail"], before)
+        self.assertIn("Неизвестная подстановка", self.page.show_dialog.call_args.args[0].content.value)
+
+    async def test_preview_and_reset_keep_guest_and_team_texts_independent(self):
+        guest_fields = self.app.guests_mail_view()
+        team_fields = self.app.team_mail_view()
+        guest_fields[4].value = "Текст для гостя"
+        team_fields[4].value = "Текст для команды"
+
+        for fields, expected, attachment in (
+            (guest_fields, "Текст для гостя", "Без вложений"),
+            (team_fields, "Текст для команды", "Вложение: файл не выбран"),
+        ):
+            button = fields[6].controls[0]
+            button.on_click(None)
+            dialog = self.page.show_dialog.call_args.args[0]
+            self.assertEqual(dialog.content.controls[2].value, expected)
+            self.assertEqual(dialog.content.controls[3].value, attachment)
+
+        reset_guests = guest_fields[6].controls[1]
+        reset_guests.on_click(None)
+        self.assertEqual(guest_fields[4].value, DEFAULT_TEMPLATES["guests"]["body"])
+        self.assertEqual(team_fields[4].value, "Текст для команды")
+
+        self.app.script_attachment = ScriptAttachment("Сценарий.txt", b"script")
+        team_fields[6].controls[0].on_click(None)
+        self.assertEqual(self.page.show_dialog.call_args.args[0].content.controls[3].value, "Вложение: Сценарий.txt")
+        reset_team = team_fields[6].controls[1]
+        reset_team.on_click(None)
+        self.assertEqual(team_fields[4].value, DEFAULT_TEMPLATES["participants"]["body"])
 
 
 if __name__ == "__main__":

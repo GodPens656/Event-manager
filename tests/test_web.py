@@ -199,6 +199,8 @@ class BrowserUiTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_passes_uploaded_bytes_without_server_file(self):
         self.app.data["participants"] = [{"name": "Test User", "email": "test@example.com", "role": "Host"}]
         self.app.script_attachment = ScriptAttachment("scenario.txt", b"scenario")
+        saved_template = {"subject": "Команде: {name}", "body": "Ваша роль: {role}"}
+        self.app.data["mail"]["templates"]["participants"] = saved_template
         self.controls[3].controls[0].value = "sender@example.com"
         self.controls[4].value = "secret"
         captured = []
@@ -206,6 +208,7 @@ class BrowserUiTests(unittest.IsolatedAsyncioTestCase):
         def deliver(people, event_data, attachment, template):
             captured.append(attachment)
             self.assertEqual(attachment.content, b"scenario")
+            self.assertEqual(template, saved_template)
             self.assertTrue(self.app.sending)
             return 1
 
@@ -223,6 +226,41 @@ class BrowserUiTests(unittest.IsolatedAsyncioTestCase):
         with patch("Frontend.app.MailService") as mail:
             await self.app.send_buttons[1].on_click(None)
             mail.assert_not_called()
+
+    async def test_add_forms_return_to_their_own_section(self):
+        for section in ("guests", "team", "budget"):
+            with self.subTest(section=section):
+                self.page.route = f"/event/one/{section}/add"
+                await self.app.route_change(None)
+                form = self.app.content.controls[-1]
+                back_button = form.controls[1].controls[0]
+                self.page.go.reset_mock()
+                back_button.on_click(Mock(control=back_button))
+                self.page.go.assert_called_once_with(f"/event/one/{section}")
+
+    async def test_letter_sections_open_directly_and_match_both_navigation_bars(self):
+        self.app.password = "secret"
+        self.app.script_attachment = ScriptAttachment("scenario.txt", b"scenario")
+        for width in (1200, 390):
+            for section, index, title in (("mail-guests", 5, "Письмо гостям"), ("mail-team", 6, "Письмо команде")):
+                with self.subTest(width=width, section=section):
+                    self.page.width = width
+                    self.page.route = f"/event/one/{section}"
+                    await self.app.route_change(None)
+                    rail = self.app.sidebar.content.controls[0].content
+                    self.assertEqual(rail.selected_index, index)
+                    self.assertEqual(rail.destinations[index].label, title)
+                    self.assertEqual(self.page.navigation_bar.selected_index, index)
+                    self.assertEqual(self.page.navigation_bar.destinations[index].label, title)
+                    self.assertEqual(self.app.content.controls[0].value, title)
+                    self.assertIsInstance(self.app.content.controls[3], ft.TextField)
+                    self.assertEqual(self.app.sidebar.visible, width >= 760)
+                    self.assertEqual(self.page.navigation_bar.visible, width < 760)
+                    self.page.go.reset_mock()
+                    self.app.change_section(Mock(control=Mock(selected_index=index)))
+                    self.page.go.assert_called_once_with(f"/event/one/{section}")
+        self.assertEqual(self.app.password, "secret")
+        self.assertEqual(self.app.script_attachment.name, "scenario.txt")
 
     async def test_second_send_is_ignored_while_first_is_running(self):
         self.app.sending = True
@@ -342,7 +380,9 @@ class WebServerTests(unittest.TestCase):
                 "/": "Выберите мероприятие для редактирования",
                 "/events/add": "Добавить мероприятие",
                 "/event/one": "Основная информация для писем",
-                "/event/one/mail": "Тексты сохраняются отдельно",
+                "/event/one/mail": "Настройте почту и отправьте письма",
+                "/event/one/mail-guests": "Отредактируйте тему и текст письма",
+                "/event/one/mail-team": "Отредактируйте тему и текст письма",
                 "/event/one/guests/add": "Укажите имя и email",
             }
             for route, expected in routes.items():

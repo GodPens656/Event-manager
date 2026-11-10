@@ -47,7 +47,7 @@ def mail_settings(value: dict) -> dict:
     return result
 
 
-def render_mail(template: dict, person: dict, event: dict) -> tuple[str, str]:
+def render_mail(template: dict, person: dict, event: dict):
     values = {
         "name": person.get("name") or "получатель",
         "email": person.get("email", ""),
@@ -64,14 +64,17 @@ def render_mail(template: dict, person: dict, event: dict) -> tuple[str, str]:
             raise ValueError(f"{label} письма не может быть пустым")
         try:
             for _, name, spec, conversion in Formatter().parse(text):
-                if name is not None:
-                    if name not in values:
-                        raise ValueError(f"Неизвестная подстановка: {{{name}}}")
-                    if spec or conversion:
-                        raise ValueError("Используйте подстановки без форматов и преобразований")
+                if name is None:
+                    continue
+                if name not in values:
+                    raise ValueError("Неизвестная подстановка: {" + name + "}")
+                if spec or conversion:
+                    raise ValueError("Используйте подстановки без форматов и преобразований")
             result = text.format_map(values)
         except ValueError as error:
-            raise ValueError(f"{label} письма: {error}. Для обычных скобок используйте {{{{ и }}}}") from error
+            message = f"{label} письма: {error}. "
+            message += "Для обычных скобок используйте {{ и }}"
+            raise ValueError(message) from error
         if not result.strip():
             raise ValueError(f"{label} письма пуст после подстановки данных")
         if field == "subject" and ("\n" in result or "\r" in result):
